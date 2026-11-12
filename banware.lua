@@ -1266,8 +1266,28 @@ ConfigBox:AddButton('Delete Config', function()
     Library:Notify('Deleted: ' .. name, 2)
 end)
 
-pcall(function() SaveManager:BuildConfigSection(Tabs.Settings) end)
-pcall(function() ThemeManager:ApplyToTab(Tabs.Settings) end)
+local configSectionLoaded = pcall(function()
+    SaveManager:BuildConfigSection(Tabs.Settings)
+end)
+
+pcall(function()
+    ThemeManager:ApplyToTab(Tabs.Settings)
+end)
+
+-- Automatically load the previously selected config on execution.
+if configSectionLoaded then
+    task.defer(function()
+        task.wait(0.25)
+
+        local success, err = pcall(function()
+            SaveManager:LoadAutoloadConfig()
+        end)
+
+        if not success then
+            warn("[Banware] Autoload failed: " .. tostring(err))
+        end
+    end)
+end
 
 Library:SetWatermarkVisibility(false)
 
