@@ -20,7 +20,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-8"
+local BANWARE_BUILD = "v2-util-9"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -746,36 +746,19 @@ local function restoreReal()
     V.old = nil
 end
 
-local function hidePosition(realCF)
-    -- the counter outranks the hide modes: if we are fighting an altitude
-    -- spammer, being in the void is not the answer
-    if CFG.ANTIUE then
-        local au = hideAntiUE(realCF)
-        if au then return au end
-    end
-
-    local mode = CFG.HIDE_MODE
-    if mode == 'Underground' then
-        return hideUnderground(realCF)
-    elseif mode == 'Translocate' then
-        return hideTranslocate(realCF)
-    elseif mode == 'Random' then
-        return hideRandom(realCF)
-    elseif mode == 'UEKiller' then
-        return hideUE(realCF)
-    end
-    return CFrame.new(applyMotion(stepOffset(realCF.Position)))
-end
-
 --==================================================
 -- ANTI-UE  (counter to an altitude spammer)
 --==================================================
 -- Rivals validates the shooter's origin server-side, so a gun on the ground
--- cannot reach a body parked at Y+500,000 — the range check fails before damage
+-- cannot reach a body parked at Y+500,000 - the range check fails before damage
 -- is ever considered. The counter is the same trick pointed the other way:
 -- replicate our origin at their altitude. Their range check now passes for
 -- both sides, and their next shot at the ground position we no longer occupy
 -- does not exist.
+--
+-- Declared above hidePosition on purpose: a Luau local only exists from the
+-- line that declares it downward, so hidePosition calling a function defined
+-- further down the file resolves to a global that is never assigned.
 local AU = { tag = 'idle', target = nil }
 
 local function hideAntiUE(realCF)
@@ -819,6 +802,27 @@ local function hideAntiUE(realCF)
         return CFrame.new(myPos.X, p.Y + off, myPos.Z)
     end
     return CFrame.new(p.X, p.Y + off, p.Z)
+end
+
+local function hidePosition(realCF)
+    -- the counter outranks the hide modes: if we are fighting an altitude
+    -- spammer, being in the void is not the answer
+    if CFG.ANTIUE then
+        local au = hideAntiUE(realCF)
+        if au then return au end
+    end
+
+    local mode = CFG.HIDE_MODE
+    if mode == 'Underground' then
+        return hideUnderground(realCF)
+    elseif mode == 'Translocate' then
+        return hideTranslocate(realCF)
+    elseif mode == 'Random' then
+        return hideRandom(realCF)
+    elseif mode == 'UEKiller' then
+        return hideUE(realCF)
+    end
+    return CFrame.new(applyMotion(stepOffset(realCF.Position)))
 end
 
 local function engineOn()
