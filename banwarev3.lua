@@ -12,7 +12,7 @@ local CollectionService = game:GetService("CollectionService")
 local LocalPlayer = Players.LocalPlayer
 local isMobile = UserInputService.TouchEnabled
 
--- Executing while a queue is still loading is the normal way this gets run, and
+-- Executing while a queue is still loading is the normal way this gets run, and 
 -- at that moment the player object is nil and the character has not replicated.
 -- Everything below assumes both, so a boot against that state half-builds the
 -- menu over a game whose own UI has not come up yet - which reads as an empty
