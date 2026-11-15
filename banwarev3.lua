@@ -12,6 +12,26 @@ local CollectionService = game:GetService("CollectionService")
 local LocalPlayer = Players.LocalPlayer
 local isMobile = UserInputService.TouchEnabled
 
+-- Executing while a queue is still loading is the normal way this gets run, and
+-- at that moment the player object is nil and the character has not replicated.
+-- Everything below assumes both, so a boot against that state half-builds the
+-- menu over a game whose own UI has not come up yet - which reads as an empty
+-- game with no hotbar. Wait for the two things the file needs, with a ceiling
+-- so an execute on a menu screen still boots instead of hanging.
+pcall(function()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    if not LocalPlayer then
+        LocalPlayer = Players:WaitForChild('LocalPlayer', 30)
+    end
+    local deadline = os.clock() + 10
+    while LocalPlayer and not LocalPlayer.Character and os.clock() < deadline do
+        task.wait(0.2)
+    end
+    if LocalPlayer and LocalPlayer.Character then
+        LocalPlayer.Character:WaitForChild('HumanoidRootPart', 10)
+    end
+end)
+
 local GameName = "Unknown Game"
 pcall(function()
     local info = MarketplaceService:GetProductInfo(game.PlaceId)
@@ -20,7 +40,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-27"
+local BANWARE_BUILD = "v2-util-28"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -157,13 +177,21 @@ pcall(function()
         if old then old:Destroy() end
     end
     -- also scan PlayerGui
-    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local pg = LocalPlayer and LocalPlayer:FindFirstChild("PlayerGui")
     if pg then
         for _, name in ipairs({"BanwareHUD", "Banware_Buttons"}) do
             local old = pg:FindFirstChild(name)
             if old then old:Destroy() end
         end
     end
+end)
+
+-- Put the game's own interface back on. Nothing in this file ever switches the
+-- core UI off, so an enable is always safe - and it is the one thing that
+-- undoes a hotbar/topbar left hidden by a body that sat out of bounds or by a
+-- previous run that died mid-boot.
+pcall(function()
+    game:GetService('StarterGui'):SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
 end)
 
 --==================================================
@@ -1741,12 +1769,19 @@ local function voidStep(dt)
     -- under it is not movement, it is the lie having been accepted and the
     -- server dragging the assembly down. Put the body back and drop the cache.
     local py = realCF.Position.Y
-    if not HIDE.seatY or py > HIDE.seatY then
+    -- only a sane surface height is worth seating on: a body that is already
+    -- sunk (a previous run, or an execute that landed mid-fall) would otherwise
+    -- pin the seat at -1e6 and the watchdog would never see a fall again
+    if py > -1000 and (not HIDE.seatY or py > HIDE.seatY) then
         HIDE.seatY, HIDE.seatX, HIDE.seatZ = py, realCF.Position.X, realCF.Position.Z
-    elseif py < HIDE.seatY - 150 then
+    end
+    if HIDE.seatY and py < HIDE.seatY - 150 then
         pcall(function()
             hrp.AssemblyLinearVelocity = Vector3.zero
             hrp.CFrame = CFrame.new(HIDE.seatX, HIDE.seatY, HIDE.seatZ)
+            -- the game hides the hotbar and the round UI the moment a body is
+            -- out of bounds; putting the body back is not enough on its own
+            game:GetService('StarterGui'):SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
         end)
         HIDE.ugPos, HIDE.ugHold, HIDE.ugAt = nil, 0, 0
         HIDE.ueY = 0
