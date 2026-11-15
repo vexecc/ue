@@ -20,11 +20,134 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-9"
+local BANWARE_BUILD = "v2-util-18"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
 print("[Banware] Game Detected: " .. GameName)
+
+-- Console output is useless when another script is throwing hundreds of lines a
+-- second; a 2500-line buffer keeps about eighteen seconds of anything. Boot
+-- markers and UE's failure text go to a file instead, where the spray cannot
+-- reach them and where the whole run can be read at once.
+local DIAG_PATH = 'Banware/diag.txt'
+local diagLines = {}
+
+local function bwDiag(text)
+    diagLines[#diagLines + 1] = string.format('[%s] %s', os.date('%H:%M:%S'), tostring(text))
+    while #diagLines > 600 do table.remove(diagLines, 1) end
+    if type(writefile) ~= 'function' then return end
+    pcall(function()
+        if type(makefolder) == 'function' and type(isfolder) == 'function' and not isfolder('Banware') then
+            makefolder('Banware')
+        end
+        writefile(DIAG_PATH, table.concat(diagLines, '\n'))
+    end)
+end
+
+bwDiag('boot start ' .. BANWARE_BUILD)
+bwDiag('game ' .. tostring(GameName))
+
+-- Unnamed Enhancements patches constants in its own compiled chunks through
+-- debug.setconstant. When the game hands it a closure it never registered, the
+-- index it looks up is nil and the C function throws:
+--   invalid argument #2 to 'setconstant' (number expected, got nil)
+-- That throw travels up through the game's own OnChanged callback and kills the
+-- menu - the window opens, then dies on the first item change. Tolerating a
+-- missing index only removes a crash that was already aborting the patch, so
+-- UE keeps running and simply skips the update it could not compute.
+-- The executor hands each chunk its own environment, and _G is not that table:
+-- rawget(_G, 'debug') came back nil and the guard reported "no debug library"
+-- while UE was busy calling the thing. Resolve through the plain global first -
+-- that is the environment this chunk actually runs in - and only then through
+-- getgenv() and the caller's fenv.
+local function bwDebugTable()
+    local direct = debug
+    if type(direct) == 'table' or type(direct) == 'userdata' then return direct end
+    if type(getgenv) == 'function' then
+        local ok, env = pcall(getgenv)
+        if ok and type(env) == 'table' then
+            local value = rawget(env, 'debug')
+            if type(value) == 'table' or type(value) == 'userdata' then return value end
+        end
+    end
+    if type(getfenv) == 'function' then
+        local ok, env = pcall(getfenv, 0)
+        if ok and type(env) == 'table' then
+            local value = rawget(env, 'debug')
+            if type(value) == 'table' or type(value) == 'userdata' then return value end
+        end
+    end
+    return nil
+end
+
+local bwSetConstantShim
+local bwSetConstantSkips = 0
+local function bwGuardSetConstant()
+    local dbg = bwDebugTable()
+    if dbg == nil then return 'no debug library (debug=' .. type(debug) .. ')' end
+    local readOk, orig = pcall(function() return dbg.setconstant end)
+    if not readOk or type(orig) ~= 'function' then
+        return 'setconstant absent from ' .. type(dbg)
+    end
+    if bwSetConstantShim ~= nil and orig == bwSetConstantShim then return 'already guarded' end
+    -- A hook that replaces the original function also makes the captured
+    -- reference call the hook again. One level of re-entry is all that is ever
+    -- wanted here, and a second pass is dropped rather than recursed.
+    local inShim = false
+    local function shim(fn, index, value)
+        if type(index) ~= 'number' then
+            bwSetConstantSkips = bwSetConstantSkips + 1
+            if bwSetConstantSkips == 1 or bwSetConstantSkips % 200 == 0 then
+                bwDiag('setconstant skipped ' .. bwSetConstantSkips .. ' call(s) with a nil index')
+            end
+            return nil
+        end
+        if inShim then return nil end
+        inShim = true
+        local ok, result = pcall(orig, fn, index, value)
+        inShim = false
+        if not ok then return nil end
+        return result
+    end
+    bwSetConstantShim = shim
+
+    local replaced = false
+    if type(hookfunction) == 'function' then
+        replaced = pcall(hookfunction, orig, shim)
+    end
+    if not replaced and type(replaceclosure) == 'function' then
+        replaced = pcall(replaceclosure, orig, shim)
+    end
+    if not replaced then
+        replaced = pcall(function() dbg.setconstant = shim end)
+    end
+    if not replaced then
+        -- The debug table is usually write-protected; lifting the metatable's
+        -- readonly bit for the single assignment is the standard route and it
+        -- is put straight back.
+        replaced = pcall(function()
+            local mt = type(getrawmetatable) == 'function' and getrawmetatable(dbg) or nil
+            if mt and type(setreadonly) == 'function' then setreadonly(mt, false) end
+            dbg.setconstant = shim
+            if mt and type(setreadonly) == 'function' then setreadonly(mt, true) end
+        end)
+    end
+
+    -- Prove it rather than assume it: a nil index used to throw, so if this
+    -- call returns instead of erroring the shim is live on the exact path UE
+    -- takes. Reporting "guarded" without this check is how the last build sent
+    -- you back into the same round.
+    local testOk = pcall(function() return dbg.setconstant(function() end, nil, 1) end)
+    if testOk then
+        return replaced and 'guarded (hooked)' or 'guarded (reassigned)'
+    end
+    return 'setconstant still throws at the call site'
+end
+
+local bwSetConstantState = bwGuardSetConstant()
+bwDiag('setconstant guard: ' .. bwSetConstantState)
+print('[Banware] setconstant guard: ' .. bwSetConstantState)
 
 -- Remove any leftover Banware UI from previous executes
 pcall(function()
@@ -104,32 +227,268 @@ end
 
 local Library, libraryOrigin
 
-local function loadLibrary()
-    local shared = getgenv and getgenv().Linoria
-    if type(shared) == 'table' and shared.CreateWindow then
-        return shared, 'getgenv'
-    end
+-- The library publishes itself the moment it finishes compiling:
+--   getgenv().Linoria = Library            (always)
+--   getgenv().Library = Library            (unless skip_getgenv_linoria)
+-- and Library:Unload() sets getgenv().Linoria = nil. Both of those walk over any
+-- other script using the same fork. A loader that adopts getgenv().Linoria then
+-- inherits our library table, paints our colours over it, hangs its window on
+-- the ScreenGui our copy owns, and when either script unloads the GUI both were
+-- drawing into dies. This wrapper hides the footprint: whatever was in those
+-- globals before the compile is put back afterwards, and the skip flag stops the
+-- Library alias from being written at all.
+local function compileIsolated(source, name)
+    local env = (getgenv and getgenv()) or _G
+    local hadLinoria, prevLinoria = env.Linoria ~= nil, env.Linoria
+    local hadLibrary, prevLibrary = env.Library ~= nil, env.Library
+    local prevSkip = env.skip_getgenv_linoria
 
+    env.skip_getgenv_linoria = true
+    local ok, lib, err = pcall(compile, source, name)
+    env.skip_getgenv_linoria = prevSkip
+
+    if hadLinoria then env.Linoria = prevLinoria else env.Linoria = nil end
+    if hadLibrary then env.Library = prevLibrary else env.Library = nil end
+
+    if not ok then return nil, tostring(lib) end
+    return lib, err
+end
+
+-- Only our own ScreenGui is destroyed here, and the foreign handle that
+-- Library:Unload() nils out is put back exactly as it was found.
+local function bwUnload()
+    local env = (getgenv and getgenv()) or _G
+    local hadLinoria, prevLinoria = env.Linoria ~= nil, env.Linoria
+    pcall(function() Library:Unload() end)
+    if hadLinoria then env.Linoria = prevLinoria end
+end
+
+-- Loaded fresh from our own cache or a mirror, always. A previous version of
+-- this loader adopted `getgenv().Linoria` when another script had published one
+-- there, which meant two menus shared a single Library table: our colour writes
+-- repainted their window, CreateWindow hung our tabs inside their ScreenGui, and
+-- whichever script unloaded first destroyed the GUI both were drawing into.
+-- The library's ScreenGui is a module-level local, so two independently
+-- compiled copies never touch each other - sharing a table is the only way they
+-- can collide, and this no longer does.
+local FOREIGN_LIB_GLOBALS = { 'Linoria', 'LinoriaLib', 'LinoriaLibrary' }
+
+local function loadLibrary()
     local cached = readCached(LIB_CACHE)
     if cached then
-        local lib, err = compile(cached, 'BanwareLibraryCache')
+        local lib, err = compileIsolated(cached, 'BanwareLibraryCache')
         if lib then return lib, 'cache' end
         print('[Banware] cached library rejected: ' .. tostring(err))
+        bwDiag('cached library rejected: ' .. tostring(err))
+    else
+        bwDiag('no cached library at ' .. LIB_CACHE)
     end
 
     for _, base in ipairs(MIRRORS) do
         local source = fetchText(base .. 'Library.lua')
         if source then
-            local lib, err = compile(source, 'BanwareLibrary')
+            local lib, err = compileIsolated(source, 'BanwareLibrary')
             if lib then
                 writeCached(LIB_CACHE, source)
                 return lib, base
             end
             print('[Banware] mirror rejected ' .. base .. ': ' .. tostring(err))
+            bwDiag('mirror rejected ' .. base .. ': ' .. tostring(err))
+        else
+            bwDiag('mirror unreachable ' .. base)
         end
     end
     return nil, nil
 end
+
+-- A library table left in getgenv() by an earlier execute whose ScreenGui is
+-- already gone is worse than none at all: another script that boots by saving
+-- "whatever Library was there" will treat the corpse as its own leftover and
+-- destroy its ScreenGui on error, and its reload guard then refuses to start
+-- again because the dead instance still counts as running. Clearing only the
+-- ones with a destroyed window leaves a live foreign library untouched.
+local function isDeadLibrary(t)
+    if type(t) ~= 'table' or type(t.CreateWindow) ~= 'function' then return false end
+    local gui = t.ScreenGui
+    if gui == nil then return true end
+    if type(typeof) == 'function' and typeof(gui) == 'Instance' then
+        return gui.Parent == nil
+    end
+    return false
+end
+
+for _, name in ipairs(FOREIGN_LIB_GLOBALS) do
+    local env = getgenv and getgenv()
+    if env then
+        local value = rawget(env, name)
+        if isDeadLibrary(value) then
+            env[name] = nil
+            print('[Banware] cleared stale ' .. name .. ' (window already destroyed)')
+        elseif type(value) == 'table' then
+            print('[Banware] another script published ' .. name
+                .. ' - leaving it alone, running on our own copy')
+        end
+    end
+end
+
+-- Unnamed Enhancements parks its run state in getgenv() and refuses to boot
+-- while that record still claims to be loaded:
+--   if previous.status == 'starting' or 'entry_returned' then return previous
+-- A record left behind by a menu that closed without its exit path running - a
+-- boot error, a destroyed window - blocks every later execute with no output
+-- at all. Cleared only when the record itself says it is finished; a live UE
+-- is left exactly where it is, which is the case that matters here, because
+-- both menus run side by side and neither shares a library table any more.
+local UE_KEY = 'Unnamed Enhancements - Cracked'
+local UE_SOURCE = 'https://raw.githubusercontent.com/hiopamhiopam-source/Uecrack-/refs/heads/main/UeCrack.txt'
+local UE_CACHE = 'Banware/UeCrack.txt'
+
+local function bwUeRecord()
+    local env = getgenv and getgenv()
+    if not env then return nil, nil end
+    return rawget(env, UE_KEY), env
+end
+
+local function bwUeFinished(rec)
+    return rec.stopped == true
+        or rec.status == 'error'
+        or rec.status == 'unloaded'
+end
+
+-- UE writes its boot failure to the record and returns; the console never sees
+-- it. Reading it before the record is cleared is the only chance to see why the
+-- menu died, because clearing hands that evidence to the garbage collector.
+local function bwUeErrorText(rec)
+    if type(rec) ~= 'table' or rec.error == nil then return nil end
+    return tostring(rec.error)
+end
+
+local function bwUeDescribe(rec)
+    if type(rec) ~= 'table' then return 'no record' end
+    local parts = {
+        'status=' .. tostring(rec.status),
+        'stopped=' .. tostring(rec.stopped),
+        'elapsed=' .. tostring(rec.elapsed),
+    }
+    local err = bwUeErrorText(rec)
+    if err then
+        parts[#parts + 1] = 'error=' .. err
+    end
+    return table.concat(parts, ' ')
+end
+
+-- Returns true only when a record was actually cleared. A live UE is never
+-- touched - that is the whole point of running the two menus together.
+local function bwClearUE(force)
+    local rec, env = bwUeRecord()
+    if type(rec) ~= 'table' then return false, 'UE not present' end
+    if not (force or bwUeFinished(rec)) then return false, 'UE is live' end
+    rec.stopped = true
+    if env then
+        env[UE_KEY] = nil
+        if rawget(env, 'UE_LOADED') ~= nil then env.UE_LOADED = nil end
+    end
+    return true, 'cleared'
+end
+
+-- Cache first. Fetching one and a half megabytes over the network while the
+-- menu is still booting is what turns a slow connection into "the menu never
+-- opened", so the local copy is always preferred and the network is a fallback.
+local function bwUeSource()
+    local cached = readCached(UE_CACHE)
+    if cached then return cached, 'cache' end
+    local fetched = fetchText(UE_SOURCE)
+    if fetched then
+        writeCached(UE_CACHE, fetched)
+        return fetched, 'network'
+    end
+    return nil, 'no source'
+end
+
+-- Rebooting UE from here is the whole reason the reset script is gone. Called
+-- only from the button, and only from a spawned thread: it never runs on the
+-- boot path, so a slow fetch or a failing chunk cannot hold the menu closed.
+local function bwReloadUE()
+    local rec = bwUeRecord()
+    if type(rec) == 'table' and not bwUeFinished(rec) then
+        return false, 'UE is live'
+    end
+    local err = bwUeErrorText(rec)
+    bwClearUE(true)
+    if err then bwDiag('ue error before reload: ' .. err) end
+
+    local source, origin = bwUeSource()
+    if not source then
+        bwDiag('ue reload aborted: no source available')
+        return false, 'no UE source - connect once to cache it'
+    end
+    bwDiag('ue source from ' .. origin .. ' (' .. #source .. ' bytes)')
+
+    local chunk, cerr = loadstring(source)
+    if type(chunk) ~= 'function' then
+        chunk, cerr = loadstring(source, '=UeCrack')
+    end
+    if type(chunk) ~= 'function' then
+        bwDiag('ue loadstring refused: ' .. tostring(cerr))
+        return false, 'loadstring refused the source: ' .. tostring(cerr)
+    end
+
+    task.spawn(function()
+        local ok, result = pcall(chunk)
+        if ok then
+            bwDiag('ue chunk returned: ' .. type(result))
+            print('[Banware] UE reloaded')
+        else
+            bwDiag('ue chunk threw: ' .. tostring(result))
+            print('[Banware] UE reload threw: ' .. tostring(result))
+        end
+    end)
+    return true, 'reloaded'
+end
+
+-- Read-only. Banware never writes to UE's run record on its own: clearing it or
+-- forcing stopped=true while UE still has closures alive is the kind of poke
+-- that turns a recoverable menu into a dead one. This only looks, and only
+-- reports - to the console once, and to diag.txt in full.
+local function bwWatchUE(tag)
+    local rec = bwUeRecord()
+    if type(rec) ~= 'table' then
+        bwDiag(tag .. ': no UE record')
+        return
+    end
+    bwDiag(tag .. ': ' .. bwUeDescribe(rec))
+    if not bwUeFinished(rec) then
+        print('[Banware] UE is live, running alongside')
+        return
+    end
+    local err = bwUeErrorText(rec)
+    if err then
+        print('[Banware] UE failed: ' .. err)
+        print('[Banware] full text in Banware/diag.txt - Settings > UI Settings > Reload UE brings it back')
+    else
+        print('[Banware] UE stopped (' .. tostring(rec.status) .. ') - Settings > UI Settings > Reload UE brings it back')
+    end
+end
+
+-- Nothing on this path may take the menu down with it: a mistake in the UE
+-- bookkeeping would otherwise present as "banware stopped opening".
+pcall(bwWatchUE, 'boot')
+
+-- Watches a UE that dies while this menu is already up. Fast enough to catch a
+-- record UE writes and forgets about half a second later, and it never writes.
+pcall(task.spawn, function()
+    local env = getgenv and getgenv()
+    if not env then return end
+    local seen
+    for _ = 1, 2400 do
+        task.wait(0.25)
+        local rec = rawget(env, UE_KEY)
+        if type(rec) == 'table' and rec ~= seen and bwUeFinished(rec) then
+            seen = rec
+            pcall(bwWatchUE, 'watch')
+        end
+    end
+end)
 
 Library, libraryOrigin = loadLibrary()
 if not Library then
@@ -137,6 +496,7 @@ if not Library then
         .. ' and no mirror reachable. Connect once to populate the cache.', 0)
 end
 print('[Banware] Library: ' .. tostring(libraryOrigin))
+bwDiag('library ready from ' .. tostring(libraryOrigin))
 
 -- The script reads its option registry directly; keep the name local instead of
 -- relying on the library publishing it globally.
@@ -167,9 +527,28 @@ end
 local function loadAddon(name)
     local cachePath = 'Banware/addons/' .. name .. '.lua'
     local cached = readCached(cachePath)
+
+    -- The addons publish themselves to getgenv() from inside their own chunk
+    -- (ThemeManager does it unconditionally). If another script already put its
+    -- copy there, compiling ours would overwrite the handle that script uses to
+    -- drive themes, and its next call would run against a manager bound to a
+    -- different library - a nil field away from throwing in a render step. Grab
+    -- whatever was there, let the compile run, put it back.
+    local env = (getgenv and getgenv()) or _G
+    local globals = { 'LinoriaThemeManager', 'LinoriaSaveManager' }
+    local saved = {}
+    for _, key in ipairs(globals) do
+        if type(env[key]) == 'table' then saved[key] = env[key] end
+    end
+
+    local function restore()
+        for key, value in pairs(saved) do env[key] = value end
+    end
+
     if cached then
         local addon = compile(cached, 'Banware' .. name)
-        if addon then return addon end
+        if addon then restore() return addon end
+        restore()
     end
     for _, base in ipairs(MIRRORS) do
         local source = fetchText(base .. 'addons/' .. name .. '.lua')
@@ -177,10 +556,13 @@ local function loadAddon(name)
             local addon = compile(source, 'Banware' .. name)
             if addon then
                 writeCached(cachePath, source)
+                restore()
                 return addon
             end
+            restore()
         end
     end
+    restore()
     return nil
 end
 
@@ -2438,32 +2820,107 @@ local function pinSpring(holder, name)
     end)
 end
 
-local function installViewmodelHook()
+-- Motion is pinned from outside, and ClientViewModel.Update is left exactly as
+-- the game shipped it. Another menu in this game wraps that method and reads its
+-- constant table with debug.getconstants; a closure written here has a different
+-- table, so its index lookup comes back nil, debug.setconstant throws inside the
+-- game's own OnChanged callback, and that throw takes the other menu down - the
+-- window opens, then dies on the first item change.
+--
+-- The wrapper an earlier execution left on the class is unwound here first. Game
+-- tables outlive a re-execute, so that stale closure is still sitting on Update,
+-- and the game's own method is the only function upvalue it closed over.
+local function unwrapViewmodelUpdate()
     local class = viewmodelClass()
-    if not class then return false end
-    if class.__banwareCamHooked then return true end
-    local original = class.Update
-    if type(original) ~= 'function' then return false end
+    if not class then return false, 'class not loaded' end
+    if not class.__banwareCamHooked then return true, 'clean' end
 
-    class.__banwareCamHooked = true
-    class.Update = function(self, ...)
-        local item = self and self.ClientItem
-        local fighter = item and item.ClientFighter
-        if fighter and fighter.IsLocalPlayer then
-            if U.NO_RECOIL then
-                pinSpring(self, '_recoil_spring')
-                pinSpring(self, '_unrecoil_spring')
-                pinSpring(self, '_impulse_position_spring')
+    local current = class.Update
+    local dbg = bwDebugTable()
+    if type(current) ~= 'function' or dbg == nil or type(dbg.getupvalue) ~= 'function' then
+        return false, 'old wrapper cannot be inspected'
+    end
+
+    for i = 1, 8 do
+        local name, value = dbg.getupvalue(current, i)
+        if name == nil then break end
+        if type(value) == 'function' and value ~= current then
+            -- The wrapper closed over exactly one game function - the method it
+            -- replaced - and over pinSpring, which must never be installed here.
+            -- The upvalue name settles it; the source is only a second opinion.
+            local pick = name == 'original'
+            if not pick and name ~= 'pinSpring' then
+                local info
+                if type(dbg.getinfo) == 'function' then
+                    local ok, got = pcall(dbg.getinfo, value)
+                    if ok then info = got end
+                end
+                local source = info and info.source
+                pick = type(source) == 'string'
+                    and not string.find(string.lower(source), 'banware', 1, true)
             end
-            if U.NO_SWAY then
-                pinSpring(self, '_sway_spring')
-                pinSpring(self, '_tilt_spring')
-                pinSpring(self, '_bobbing_value_spring')
+            if pick then
+                class.Update = value
+                class.__banwareCamHooked = nil
+                return true, 'restored (' .. tostring(name) .. ')'
             end
         end
-        return original(self, ...)
     end
-    return true
+    return false, 'no game closure among the old upvalues'
+end
+
+-- Live controller tables, refreshed once a second because a respawn builds a new
+-- fighter. Pinning is two table writes per spring, so it runs per frame from the
+-- cache and never touches a method the game or another menu owns.
+do
+    local list = {}
+
+    local function remember(vm)
+        if type(vm) ~= 'table' then return end
+        for i = 1, #list do
+            if list[i] == vm then return end
+        end
+        if #list < 64 then list[#list + 1] = vm end
+    end
+
+    local function refresh()
+        local items = listItems(localFighter())
+        for i = 1, #items do
+            local item = items[i]
+            local vm = rawget(item, 'ViewModel')
+            if type(vm) ~= 'table' then
+                local ok, got = pcall(function() return item.ViewModel end)
+                if ok then vm = got end
+            end
+            remember(vm)
+        end
+    end
+
+    local function pin()
+        if not (U.NO_RECOIL or U.NO_SWAY) then return end
+        for i = 1, #list do
+            local vm = list[i]
+            if U.NO_RECOIL then
+                pinSpring(vm, '_recoil_spring')
+                pinSpring(vm, '_unrecoil_spring')
+                pinSpring(vm, '_impulse_position_spring')
+            end
+            if U.NO_SWAY then
+                pinSpring(vm, '_sway_spring')
+                pinSpring(vm, '_tilt_spring')
+                pinSpring(vm, '_bobbing_value_spring')
+            end
+        end
+    end
+
+    task.spawn(function()
+        while true do
+            pcall(refresh)
+            task.wait(1)
+        end
+    end)
+    RunService.RenderStepped:Connect(function() pcall(pin) end)
+    RunService.Heartbeat:Connect(function() pcall(pin) end)
 end
 
 -- CameraController is returned as an instance, so the wrapper goes on the
@@ -2491,13 +2948,15 @@ local function installShakeHook()
 end
 
 local function installCameraHooks()
-    local a = installViewmodelHook()
+    local clean, why = unwrapViewmodelUpdate()
+    CAM.restored, CAM.restoreWhy = clean, why
     local b = installShakeHook()
-    CAM.installed = a or b
+    CAM.installed = clean and b
     return CAM.installed
 end
 
 installCameraHooks()
+bwDiag('viewmodel: ' .. tostring(CAM.restoreWhy) .. ' - Update untouched, motion polled')
 
 task.spawn(function()
     for _ = 1, 85 do
@@ -5450,7 +5909,7 @@ end)
 local UISettings = Tabs.Settings:AddLeftGroupbox('UI Settings')
 UISettings:AddButton('Unload', function()
     stopVoidSound()
-    Library:Unload()
+    bwUnload()
 end)
 
 UISettings:AddLabel('Menu bind'):AddKeyPicker('MenuKeybind', {
@@ -5466,6 +5925,26 @@ UISettings:AddToggle('ShowHud', {
     Default = true,
     Callback = function(v) HudFrame.Visible = v end,
 })
+
+UISettings:AddButton('Reload UE', function()
+    local ok, why = bwReloadUE()
+    if ok then
+        Library:Notify('UE reloading', 2)
+    else
+        Library:Notify('UE not reloaded: ' .. tostring(why), 2)
+    end
+end)
+
+UISettings:AddButton('Unstick UE', function()
+    local ok, why = bwClearUE(false)
+    if ok then
+        Library:Notify('UE record cleared - reload it', 2)
+    else
+        Library:Notify('nothing to clear: ' .. tostring(why), 2)
+    end
+end)
+
+UISettings:AddLabel('Reload UE clears its run record and boots it again. A live UE is never touched. Boot and UE failure details are written to Banware/diag.txt.', true)
 
 -- Right side still has Configuration
 local ConfigBox = Tabs.Settings:AddRightGroupbox('Configuration')
@@ -5896,3 +6375,4 @@ Library:OnUnload(function()
 end)
 
 print('[Banware] Loaded Successfully | Game: ' .. GameName)
+bwDiag('gui ready, build ' .. BANWARE_BUILD)
