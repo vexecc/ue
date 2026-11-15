@@ -20,7 +20,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-18"
+local BANWARE_BUILD = "v2-util-20"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -506,7 +506,7 @@ local Toggles = Library.Toggles or {}
 -- Toggles and every other control live in two registries in this fork:
 -- Library.Toggles for switches, Library.Options for sliders, dropdowns, inputs
 -- and keypickers. Reading a toggle out of Options returns nil, and every write
--- through it is a silent no-op — so nothing in this script touches either
+-- through it is a silent no-op â€” so nothing in this script touches either
 -- table directly. Everything that sets or reads a control goes through here.
 local function optRef(key)
     return Options[key] or Toggles[key]
@@ -758,6 +758,9 @@ local elapsed = 0
 local originalPos = nil
 local voidEnabled = false
 local auStatus = nil
+-- Translocate widgets live in one table. The main chunk is at the 200-local
+-- ceiling, so handles up here are shared rather than declared one by one.
+local tlUi = {}
 local riotEnabled = false
 local aaEnabled = false
 
@@ -779,6 +782,12 @@ local CFG = {
     RAND_RADIUS = 10000,
     UE_CLIMB = 10000,
     UE_COOLDOWN = 0.2,
+    -- translocate transport: the server path is the one kicia and k1 use, the
+    -- root write stays as the fallback for a session where the controller
+    -- could not be resolved
+    TL_SERVER = true,
+    TL_GATE = true,
+    TL_RANGE = 1000,
 
     -- Anti-UE counter
     ANTIUE = false,
@@ -950,7 +959,7 @@ end
 -- VOID HIDE POSITIONS
 --==================================================
 -- Ported from kicia's evasion controller: underground (cuckkica.lua:64098),
--- translocate (63817), uekiller (64151). Each mode answers one question —
+-- translocate (63817), uekiller (64151). Each mode answers one question â€”
 -- given the body's real CFrame, where does the server need to believe it is.
 local HIDE = {
     ugPos = nil, ugAt = 0, ugParams = nil,
@@ -1013,54 +1022,266 @@ local function hideUnderground(realCF)
     return out
 end
 
--- kicia Translocate: park on the map's out-of-bounds kill brick — the part
--- tagged OutOfBoundsPart whose KillDelay attribute is zero — offset by half
--- its height plus the configured nudge. The brick is cached; the swing on top
--- of it is recomputed every call, so the body slides while the anchor stays
--- put. Maps that tag no brick fall back to a far random point.
-local function hideTranslocate(realCF)
-    local now = os.clock()
-    if not HIDE.tlPos or now >= HIDE.tlAt then
-        HIDE.tlAt = now + 0.25
+-- kicia / k1 Translocate, verbatim behaviour:
+--   compute(clientCFrame, hasTargets)
+--     if not hasTargets -> uniform random point on a 10000..1e9 shell
+--     else              -> the OutOfBoundsPart tagged KillDelay == 0, offset by
+--                          half its height plus the configured nudge (-5..5)
+-- The offset slider in both menus is -5..5 with -5 as the default, which is
+-- why the anchor sits just under the brick instead of inside it.
+--
+-- What makes it work is the transport, not the point: both menus push the
+-- result through characterController:SetServerCFrame(), so the client body
+-- never moves and only the server's idea of where the body is changes. Banware
+-- used to write root.CFrame instead, which the server reads as a client claim
+-- and mostly discards. The server path is used when the controller is
+-- resolvable and the root write stays as the fallback.
+-- Every helper the translocate transport needs lives inside one factory, so the
+-- whole subsystem costs the main chunk a single register. The chunk sits at
+-- Luau's 200-local ceiling and eleven more top-level locals is exactly what
+-- stalls the compile with "out of local registers".
+--
+-- The controller belongs to the game's own ragebot context, not to a class this
+-- chunk can require, so it is located two ways:
+--
+--   1. structurally, through the fighter singleton the game keeps under
+--      PlayerScripts. A fighter exposes its context under one of a few names,
+--      and the context carries characterController beside fighterState.
+--   2. by shape, walking the GC for a table with a characterController field.
+--      That is two rawgets per table and no method calls until a candidate
+--      appears, which is what keeps the scan off the frame budget.
+--
+-- A candidate is accepted when its GetClientCFrame() sits near our own root:
+-- the local body is the only character this client owns, so a controller that
+-- agrees with our position is ours.
+local TL = (function()
+    local CC = { inst = nil, at = 0, tries = 0, err = 'not probed' }
 
-        local part = HIDE.tlPart
-        if part and not part.Parent then
-            part = nil
-            HIDE.tlPart = nil
+    local CTX_FIELDS = { 'characterController', 'CharacterController' }
+    local FIGHTER_FIELDS = { '_innerContext', 'innerContext', '_context', 'Context', '_ragebotContext', '_client' }
+
+    local function ccMethods(c)
+        local tp = type(c)
+        if tp ~= 'table' and tp ~= 'userdata' then return nil end
+        local okS, setter = pcall(function() return c.SetServerCFrame end)
+        if not okS or type(setter) ~= 'function' then return nil end
+        local okG, getter = pcall(function() return c.GetClientCFrame end)
+        if not okG or type(getter) ~= 'function' then return nil end
+        return setter, getter
+    end
+
+    local function ccFromContext(ctx)
+        if type(ctx) ~= 'table' then return nil end
+        for i = 1, #CTX_FIELDS do
+            local c = rawget(ctx, CTX_FIELDS[i])
+            if c then
+                local setter, getter = ccMethods(c)
+                if setter then return c, getter end
+            end
         end
-        if not part then
-            local ok, tagged = pcall(function() return CollectionService:GetTagged('OutOfBoundsPart') end)
-            if ok and tagged then
-                for i = 1, #tagged do
-                    local p = tagged[i]
-                    if p and p.Parent and p:GetAttribute('KillDelay') == 0 then
-                        part = p
-                        HIDE.tlPart = p
-                        break
+        return nil
+    end
+
+    local function ccFromFighter()
+        local ok, mod = pcall(function()
+            return require(LocalPlayer.PlayerScripts.Controllers.FighterController)
+        end)
+        if not ok or type(mod) ~= 'table' then return nil end
+
+        local okF, f = pcall(function() return mod.LocalFighter end)
+        if okF and type(f) == 'table' then
+            for i = 1, #FIGHTER_FIELDS do
+                local c, getter = ccFromContext(rawget(f, FIGHTER_FIELDS[i]))
+                if c then return c, getter end
+            end
+        end
+
+        local okO, objs = pcall(function() return mod.Objects end)
+        if okO and type(objs) == 'table' then
+            for _, fig in pairs(objs) do
+                local okP, plr = pcall(function() return fig.Player end)
+                if okP and plr == LocalPlayer then
+                    for i = 1, #FIGHTER_FIELDS do
+                        local c, getter = ccFromContext(rawget(fig, FIGHTER_FIELDS[i]))
+                        if c then return c, getter end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function ccDistance(c, getter, myPos)
+        local ok, cf = pcall(getter, c)
+        if not ok or typeof(cf) ~= 'CFrame' then return nil end
+        if not myPos then return 0 end
+        return (cf.Position - myPos).Magnitude
+    end
+
+    local function resolve()
+        if CC.inst then return CC.inst end
+        local now = os.clock()
+        if now < CC.at then return nil end
+        -- a session that never resolves must not pay a full GC walk every three
+        -- seconds, so the retry interval climbs to twenty and stays there
+        CC.tries = CC.tries + 1
+        CC.at = now + math.min(3 + CC.tries * 0.5, 20)
+
+        local hrp = getRoot()
+        local myPos = hrp and hrp.Position
+
+        local c, getter = ccFromFighter()
+        if c and getter then
+            local d = ccDistance(c, getter, myPos)
+            if d and d < 250 then
+                CC.inst = c
+                CC.err = nil
+                bwDiag(string.format('cc: via fighter, %.0f studs, try %d', d, CC.tries))
+                return c
+            end
+        end
+
+        if type(getgc) ~= 'function' then
+            CC.err = 'getgc unavailable'
+            return nil
+        end
+        local ok, objs = pcall(getgc)
+        if not ok or type(objs) ~= 'table' then
+            CC.err = 'getgc failed'
+            return nil
+        end
+
+        local best, bestDist, found = nil, math.huge, 0
+        for i = 1, #objs do
+            local t = objs[i]
+            if type(t) == 'table' then
+                for j = 1, #CTX_FIELDS do
+                    local cand = rawget(t, CTX_FIELDS[j])
+                    if cand then
+                        local setter, get = ccMethods(cand)
+                        if setter then
+                            found = found + 1
+                            local d = ccDistance(cand, get, myPos) or math.huge
+                            if d < bestDist then bestDist, best = d, cand end
+                        end
                     end
                 end
             end
         end
 
-        if not part then
-            HIDE.tlPos = randomAround(realCF.Position, 10000, 1e9)
-        else
+        if best then
+            CC.inst = best
+            CC.err = nil
+            bwDiag(string.format('cc: via scan, %d candidate(s), nearest %.0f studs, try %d',
+                found, bestDist, CC.tries))
+            return best
+        end
+        CC.err = string.format('no controller (%d candidates, try %d)', found, CC.tries)
+        return nil
+    end
+
+    -- kicia drops the lie the moment the mode is no longer translocate; leaving
+    -- a server CFrame behind pins the body for the rest of the session.
+    local function release()
+        local cc = CC.inst
+        if not cc then return end
+        pcall(function() cc:SetServerCFrame(nil) end)
+    end
+
+    local function push(cf)
+        local cc = resolve()
+        if not cc then return false end
+        local ok = pcall(function() cc:SetServerCFrame(cf) end)
+        if not ok then
+            CC.inst = nil
+            CC.at = 0
+            return false
+        end
+        return true
+    end
+
+    local function part()
+        local p = HIDE.tlPart
+        if p and not p.Parent then
+            HIDE.tlPart = nil
+            p = nil
+        end
+        if p then return p end
+
+        local ok, tagged = pcall(function() return CollectionService:GetTagged('OutOfBoundsPart') end)
+        if not ok or not tagged then return nil end
+        for i = 1, #tagged do
+            local q = tagged[i]
+            if q and q.Parent and q:GetAttribute('KillDelay') == 0 then
+                HIDE.tlPart = q
+                return q
+            end
+        end
+        return nil
+    end
+
+    local function hasTarget()
+        local hrp = getRoot()
+        if not hrp then return false end
+        local my = hrp.Position
+        local maxD = math.clamp(CFG.TL_RANGE or 1000, 50, 1e7)
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local ch = plr.Character
+                local rp = ch and ch:FindFirstChild('HumanoidRootPart')
+                local h = ch and ch:FindFirstChildOfClass('Humanoid')
+                if rp and h and h.Health > 0 and (rp.Position - my).Magnitude <= maxD then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    return {
+        state = CC,
+        probe = resolve,
+        release = release,
+        push = push,
+        part = part,
+        hasTarget = hasTarget,
+    }
+end)()
+
+-- Swing is ours, not theirs: both source menus hold the anchor still. It is
+-- only applied on the root-write fallback, because sliding a server CFrame the
+-- body is not standing on is a larger lie every frame and buys nothing.
+local function hideTranslocate(realCF, withSwing)
+    local now = os.clock()
+    if not HIDE.tlPos or now >= HIDE.tlAt then
+        HIDE.tlAt = now + 0.25
+        local gated = CFG.TL_GATE ~= false
+        local has = (not gated) or TL.hasTarget()
+        local part = has and TL.part() or nil
+        if part then
             local offset = math.clamp(CFG.TL_OFFSET, -5, 5)
             HIDE.tlPos = part.CFrame * CFrame.new(0, -part.Size.Y / 2 + offset, 0)
+            HIDE.tlTag = 'brick'
+        else
+            HIDE.tlPos = randomAround(realCF.Position, 10000, 1e9)
+            HIDE.tlTag = gated and 'no target - shell' or 'no brick - shell'
         end
     end
 
     local base = HIDE.tlPos
     if not base then return nil end
 
-    local swing = math.clamp(CFG.TL_SWING or 0, 0, 1e9)
-    if swing > 0 then
-        local speed = math.max(CFG.TL_SPEED or 1, 0.05)
-        local x = math.cos(elapsed * math.pi * 2 * speed) * swing
-        return base + Vector3.new(x, 0, 0)
+    if withSwing then
+        local swing = math.clamp(CFG.TL_SWING or 0, 0, 1e9)
+        if swing > 0 then
+            local speed = math.max(CFG.TL_SPEED or 1, 0.05)
+            local x = math.cos(elapsed * math.pi * 2 * speed) * swing
+            return base + Vector3.new(x, 0, 0)
+        end
     end
     return base
 end
+
 
 -- kicia Random: shell around the body, base radius scaled by a random factor.
 local function hideRandom(realCF)
@@ -1081,12 +1302,12 @@ local function hideUE(realCF)
 end
 
 --==================================================
--- ROOT WRITE — fake on Heartbeat, truth back before render
+-- ROOT WRITE â€” fake on Heartbeat, truth back before render
 --==================================================
 -- kicia's root desync (kiciapermcleaned.lua:124086): read the live CFrame,
 -- remember it, write the lie. The render step puts the truth back at
--- RenderPriority.First — before the camera is drawn and before the physics
--- step — so the body keeps moving normally while the server is told something
+-- RenderPriority.First â€” before the camera is drawn and before the physics
+-- step â€” so the body keeps moving normally while the server is told something
 -- else. Velocities are saved across the fake write so the lie never flings the
 -- real body when it comes back.
 local V = { old = nil, fake = nil, lv = nil, av = nil }
@@ -1186,7 +1407,7 @@ local function hideAntiUE(realCF)
     return CFrame.new(p.X, p.Y + off, p.Z)
 end
 
-local function hidePosition(realCF)
+local function hidePosition(realCF, withSwing)
     -- the counter outranks the hide modes: if we are fighting an altitude
     -- spammer, being in the void is not the answer
     if CFG.ANTIUE then
@@ -1198,7 +1419,7 @@ local function hidePosition(realCF)
     if mode == 'Underground' then
         return hideUnderground(realCF)
     elseif mode == 'Translocate' then
-        return hideTranslocate(realCF)
+        return hideTranslocate(realCF, withSwing)
     elseif mode == 'Random' then
         return hideRandom(realCF)
     elseif mode == 'UEKiller' then
@@ -1222,24 +1443,51 @@ local function voidStep(dt)
     local realCF = hrp.CFrame
     if not originalPos then originalPos = realCF.Position end
 
-    local fake = hidePosition(realCF)
+    -- Translocate asks the question the other modes do not: is the server
+    -- reachable? If it is, the lie goes down the game's own controller and the
+    -- body never moves. If it is not, the old root write keeps the mode usable.
+    local serverPath = CFG.HIDE_MODE == 'Translocate'
+        and CFG.TL_SERVER == true
+        and TL.probe() ~= nil
+
+    local fake = hidePosition(realCF, not serverPath)
     if not fake then return end
     local p = fake.Position
     if p.X ~= p.X or p.Y ~= p.Y or p.Z ~= p.Z then return end
 
-    V.old = realCF
-    V.fake = fake
-    writeFake(hrp, fake)
+    if serverPath and TL.push(fake) then
+        -- kicia's path: the body is not moved at all, so there is nothing for
+        -- the render step to put back
+        V.old = nil
+        V.fake = nil
+    else
+        V.old = realCF
+        V.fake = fake
+        writeFake(hrp, fake)
+    end
 
     V.tick = (V.tick or 0) + 1
-    if auStatus and V.tick % 6 == 0 then
-        pcall(function()
-            if CFG.ANTIUE then
-                auStatus:SetText(string.format('%s | %s', CFG.AU_MODE, AU.tag))
-            else
-                auStatus:SetText('off')
-            end
-        end)
+    if V.tick % 6 == 0 then
+        if auStatus then
+            pcall(function()
+                if CFG.ANTIUE then
+                    auStatus:SetText(string.format('%s | %s', CFG.AU_MODE, AU.tag))
+                else
+                    auStatus:SetText('off')
+                end
+            end)
+        end
+        if tlUi.status and CFG.HIDE_MODE == 'Translocate' then
+            pcall(function()
+                if TL.state.inst then
+                    tlUi.status:SetText(string.format('controller: live | %s | %s',
+                        CFG.TL_SERVER and 'server cframe' or 'root write',
+                        tostring(HIDE.tlTag or '-')))
+                else
+                    tlUi.status:SetText('controller: ' .. tostring(TL.state.err))
+                end
+            end)
+        end
     end
 end
 
@@ -1272,6 +1520,7 @@ function stopVoid()
     killConn("void")
     pcall(function() RunService:UnbindFromRenderStep('BanwareVoidRestore') end)
     restoreReal()
+    TL.release()
     V.old, V.fake, V.lv, V.av = nil, nil, nil, nil
     resetHide()
     originalPos = nil
@@ -1406,7 +1655,7 @@ VoidRight:AddLabel('^^^ MOST IMPORTANT FEATURE')
 -- does nothing.
 local PosBox = Tabs.Void:AddLeftGroupbox('Hide Position')
 
-local ugDepth, tlOffset, randRadius, ueClimb, ueCooldown, tlSwing, tlSpeed
+local vis = {}
 
 local function setVis(o, on)
     if o then pcall(function() o:SetVisible(on) end) end
@@ -1415,13 +1664,18 @@ end
 local function posModeChanged(v)
     CFG.HIDE_MODE = v
     resetHide()
-    setVis(ugDepth, v == 'Underground')
-    setVis(tlOffset, v == 'Translocate')
-    setVis(tlSwing, v == 'Translocate')
-    setVis(tlSpeed, v == 'Translocate')
-    setVis(randRadius, v == 'Random')
-    setVis(ueClimb, v == 'UEKiller')
-    setVis(ueCooldown, v == 'UEKiller')
+    if v ~= 'Translocate' then TL.release() end
+    setVis(vis.ugDepth, v == 'Underground')
+    setVis(vis.tlOffset, v == 'Translocate')
+    setVis(vis.tlSwing, v == 'Translocate')
+    setVis(vis.tlSpeed, v == 'Translocate')
+    setVis(tlUi.server, v == 'Translocate')
+    setVis(tlUi.gate, v == 'Translocate')
+    setVis(tlUi.range, v == 'Translocate')
+    setVis(tlUi.status, v == 'Translocate')
+    setVis(vis.randRadius, v == 'Random')
+    setVis(vis.ueClimb, v == 'UEKiller')
+    setVis(vis.ueCooldown, v == 'UEKiller')
 end
 
 PosBox:AddDropdown('VoidHideMode', {
@@ -1431,7 +1685,7 @@ PosBox:AddDropdown('VoidHideMode', {
     Callback = posModeChanged,
 })
 
-ugDepth = PosBox:AddSlider('VoidUGDepth', {
+vis.ugDepth = PosBox:AddSlider('VoidUGDepth', {
     Text = 'Underground Depth',
     Default = 10,
     Min = 5,
@@ -1441,7 +1695,7 @@ ugDepth = PosBox:AddSlider('VoidUGDepth', {
     Callback = function(v) CFG.UG_DEPTH = v; resetHide() end,
 })
 
-tlOffset = PosBox:AddSlider('VoidTLOffset', {
+vis.tlOffset = PosBox:AddSlider('VoidTLOffset', {
     Text = 'Translocate Offset',
     Default = -5,
     Min = -5,
@@ -1451,7 +1705,7 @@ tlOffset = PosBox:AddSlider('VoidTLOffset', {
     Callback = function(v) CFG.TL_OFFSET = v; resetHide() end,
 })
 
-tlSwing = PosBox:AddSlider('VoidTLSwing', {
+vis.tlSwing = PosBox:AddSlider('VoidTLSwing', {
     Text = 'Translocate Swing',
     Default = 2000,
     Min = 0,
@@ -1461,7 +1715,7 @@ tlSwing = PosBox:AddSlider('VoidTLSwing', {
     Callback = function(v) CFG.TL_SWING = v; resetHide() end,
 })
 
-tlSpeed = PosBox:AddSlider('VoidTLSpeed', {
+vis.tlSpeed = PosBox:AddSlider('VoidTLSpeed', {
     Text = 'Translocate Speed',
     Default = 3,
     Min = 0.1,
@@ -1471,7 +1725,37 @@ tlSpeed = PosBox:AddSlider('VoidTLSpeed', {
     Callback = function(v) CFG.TL_SPEED = v end,
 })
 
-randRadius = PosBox:AddSlider('VoidRandRadius', {
+tlUi.server = PosBox:AddToggle('VoidTLServer', {
+    Text = 'Translocate Via Server',
+    Default = true,
+    Tooltip = 'Push the anchor through the game\'s own CharacterController:SetServerCFrame, like kicia and k1. The body stays put and only the server is moved.',
+    Callback = function(v)
+        CFG.TL_SERVER = v
+        if not v then TL.release() end
+        Library:Notify(v and 'translocate: server path' or 'translocate: root write', 2)
+    end,
+})
+
+tlUi.gate = PosBox:AddToggle('VoidTLGate', {
+    Text = 'Brick Only With Target',
+    Default = true,
+    Tooltip = 'kicia and k1 only anchor to the out-of-bounds brick while a target exists; with none they jump to a 10000-1e9 shell instead. Off: always the brick.',
+    Callback = function(v) CFG.TL_GATE = v; resetHide() end,
+})
+
+tlUi.range = PosBox:AddSlider('VoidTLRange', {
+    Text = 'Translocate Target Range',
+    Default = 1000,
+    Min = 50,
+    Max = 10000,
+    Rounding = 0,
+    Unit = ' studs',
+    Callback = function(v) CFG.TL_RANGE = v end,
+})
+
+tlUi.status = PosBox:AddLabel('controller: not probed')
+
+vis.randRadius = PosBox:AddSlider('VoidRandRadius', {
     Text = 'Random Base Radius',
     Default = 10000,
     Min = 5,
@@ -1481,7 +1765,7 @@ randRadius = PosBox:AddSlider('VoidRandRadius', {
     Callback = function(v) CFG.RAND_RADIUS = v; resetHide() end,
 })
 
-ueClimb = PosBox:AddSlider('VoidUEClimb', {
+vis.ueClimb = PosBox:AddSlider('VoidUEClimb', {
     Text = 'UEKiller Climb',
     Default = 10000,
     Min = 100,
@@ -1491,7 +1775,7 @@ ueClimb = PosBox:AddSlider('VoidUEClimb', {
     Callback = function(v) CFG.UE_CLIMB = v; resetHide() end,
 })
 
-ueCooldown = PosBox:AddSlider('VoidUECooldown', {
+vis.ueCooldown = PosBox:AddSlider('VoidUECooldown', {
     Text = 'UEKiller Step',
     Default = 0.2,
     Min = 0,
@@ -6032,6 +6316,17 @@ end)
 --
 -- Wrapped in one function purely to keep the main chunk under Luau's 200-local
 -- ceiling; it runs immediately below.
+-- Built-in presets. They are not files: nothing is written to configs/settings,
+-- so they can never drift, be half-overwritten, or be deleted by the config
+-- panel. What is written is one word in autoload.txt, which is how the loader
+-- knows to apply a preset instead of opening a JSON.
+local BWP = { byId = {}, order = {}, apply = nil }
+
+if SaveManager and SaveManager.GetAutoloadConfig then
+    local ok, name = pcall(function() return SaveManager:GetAutoloadConfig() end)
+    if ok and type(name) == 'string' then BWP.autoloadName = name end
+end
+
 local __bwPresets = function()
     -- Everything "max speed" lives here once. Both weapon classes are switched
     -- on at the same time on purpose: a knife and a shotgun read different
@@ -6064,6 +6359,7 @@ local __bwPresets = function()
         MovementSpeed = 1000000,
         EffectRadius = 1000000000,
         SetXDist = 1000000, SetYDist = 0, SetZDist = 1000000,
+        VoidTLServer = true, VoidTLGate = true, VoidTLRange = 1000,
     }
 
     -- Same block split by weapon class, for the one-click swap. Only the fields
@@ -6104,7 +6400,7 @@ local __bwPresets = function()
 
     local PRESETS = {
         {
-            id = 'p1-anti-rage',
+            id = '1-anti-rage',
             label = '1 - Anti-Rage',
             theme = 'Nihon Crimson',
             sound = 'Rocket',
@@ -6122,7 +6418,7 @@ local __bwPresets = function()
             post = { EnableVoidHide = true, VoidAntiUE = true },
         },
         {
-            id = 'p2-anti-legit',
+            id = '2-anti-legit',
             label = '2 - Anti-Legit',
             theme = 'Ice Blue',
             sound = 'Glitch',
@@ -6141,7 +6437,7 @@ local __bwPresets = function()
             post = { EnableVoidHide = true, VoidAntiUE = false },
         },
         {
-            id = 'p3-ue-counter',
+            id = '3-ue-counter',
             label = '3 - UE Counter',
             theme = 'Lavender Field',
             sound = 'Pulse',
@@ -6155,7 +6451,7 @@ local __bwPresets = function()
             post = { EnableVoidHide = false, VoidAntiUE = true },
         },
         {
-            id = 'p4-everything',
+            id = '4-everything',
             label = '4 - Everything',
             theme = 'Sakura Bloom',
             sound = 'Bass',
@@ -6186,23 +6482,21 @@ local __bwPresets = function()
         return n
     end
 
-    local function savePreset(p)
-        if not SaveManager then return end
-        local ok = pcall(function() SaveManager:Save(p.id) end)
-        if ok then pcall(function() SaveManager:RefreshConfigList() end) end
+    BWP.apply = applyPreset
+    for i = 1, #PRESETS do
+        local p = PRESETS[i]
+        BWP.byId[p.id] = p
+        BWP.order[i] = p.id
     end
 
     local Box = Tabs.Settings:AddRightGroupbox('Presets')
 
-    Box:AddLabel('Applies the config, then saves it as configs/settings/<id>.json', true)
+    Box:AddLabel('Built in. Nothing is written to configs/settings.', true)
 
     for _, p in ipairs(PRESETS) do
         Box:AddButton({
             Text = p.label,
-            Func = function()
-                applyPreset(p)
-                savePreset(p)
-            end,
+            Func = function() applyPreset(p) end,
         })
         Box:AddLabel(p.blurb, true)
     end
@@ -6222,24 +6516,44 @@ local __bwPresets = function()
     })
     armed = true
 
+    -- Autoload works by name. A preset id in autoload.txt is applied from the
+    -- table above at boot; anything else still goes through the file loader, so
+    -- hand-saved configs keep working exactly as before.
+    Box:AddDivider()
+    Box:AddDropdown('PresetAutoload', {
+        Values = BWP.order,
+        Default = 1,
+        Text = 'Autoload Preset',
+    })
     Box:AddButton({
-        Text = 'Write All 4 To Disk',
+        Text = 'Set As Autoload',
         Func = function()
-            local last
-            for _, p in ipairs(PRESETS) do
-                applyPreset(p)
-                savePreset(p)
-                last = p
-                task.wait(0.15)
+            local id = optValue('PresetAutoload')
+            if type(id) ~= 'string' or not BWP.byId[id] then
+                Library:Notify('pick a preset first', 3)
+                return
             end
-            if last then
-                applyPreset(last)
-                Library:Notify('4 presets written, P4 left applied', 4)
+            if not (SaveManager and SaveManager.SaveAutoloadConfig) then
+                Library:Notify('config manager unavailable', 3)
+                return
+            end
+            local ok, err = SaveManager:SaveAutoloadConfig(id)
+            if ok then
+                Library:Notify(string.format('%q will load on execution', id), 4)
+            else
+                Library:Notify('autoload write failed: ' .. tostring(err), 4)
             end
         end,
     })
-
-    Box:AddLabel('Runs in order - the last one stays applied', true)
+    Box:AddButton({
+        Text = 'Reset Autoload',
+        Func = function()
+            if not (SaveManager and SaveManager.DeleteAutoLoadConfig) then return end
+            SaveManager:DeleteAutoLoadConfig()
+            Library:Notify('autoload cleared', 2)
+        end,
+    })
+    Box:AddLabel('Autoload: ' .. tostring(BWP.autoloadName or 'none'), true)
 end
 
 __bwPresets()
@@ -6252,10 +6566,29 @@ pcall(function()
     ThemeManager:ApplyToTab(Tabs.Settings)
 end)
 
--- Automatically load the previously selected config on execution.
+-- Automatically load the previously selected config on execution. A built-in
+-- preset id is applied from the script; anything else is a file and goes
+-- through the manager as it always did.
 if configSectionLoaded then
     task.defer(function()
         task.wait(0.25)
+
+        local name = BWP.autoloadName
+        -- autoload.txt written before the presets went in-memory holds the old
+        -- "p1-..." names; strip the prefix rather than making the user reselect
+        if type(name) == 'string' and not BWP.byId[name] and name:sub(1, 1) == 'p'
+            and BWP.byId[name:sub(2)] then
+            name = name:sub(2)
+        end
+        if name and name ~= 'none' and BWP.byId[name] then
+            local ok, n = pcall(BWP.apply, BWP.byId[name])
+            if ok then
+                Library:Notify(string.format('Auto loaded preset %q - %d options', name, n or 0), 4)
+            else
+                warn('[Banware] Preset autoload failed: ' .. tostring(n))
+            end
+            return
+        end
 
         local success, err = pcall(function()
             SaveManager:LoadAutoloadConfig()
@@ -6266,6 +6599,697 @@ if configSectionLoaded then
         end
     end)
 end
+
+--==================================================
+-- MATCH RECORDER
+--==================================================
+-- One JSON plus one Markdown file per match, one rollup per five matches.
+-- Everything is sampled from what the client is allowed to see, so the numbers
+-- are observations, not claims: positions are replicated positions, speed is
+-- displacement over sample interval, and a hit is attributed to the opponent
+-- whose aim was closest to us at the frame our health dropped.
+--
+-- The writer is deliberately dumb: pcall everything, cap every list, drop NaN
+-- and infinity before encode, and never throw into the heartbeat.
+local __bwRecorder = function()
+    local HttpService = game:GetService('HttpService')
+    local ROOT = 'Banware/matches'
+    -- declared here, not at the UI block, because control() reads it
+    local RecLabel
+
+    local R = {
+        on = true,
+        hz = 10,
+        acc = 0,
+        folder = ROOT,
+        session = os.date('%Y%m%d-%H%M%S'),
+        matchIdx = 0,
+        gameIdx = 1,
+        cur = nil,
+        clock = 0,
+        baselineY = 0,
+        gameMatches = {},
+        status = 'idle',
+        folderOk = false,
+        fc = nil,
+        fcTried = false,
+        hookHum = nil,
+        prevHealth = 0,
+        nearT = 0,
+        idleT = 0,
+        err = nil,
+    }
+
+    local function stamp()
+        return os.date('%Y-%m-%d %H:%M:%S')
+    end
+
+    local function num(v)
+        if type(v) ~= 'number' then return nil end
+        if v ~= v or v == math.huge or v == -math.huge then return nil end
+        return math.floor(v * 1000 + 0.5) / 1000
+    end
+
+    local function vec(v)
+        if typeof(v) ~= 'Vector3' then return nil end
+        return { x = num(v.X) or 0, y = num(v.Y) or 0, z = num(v.Z) or 0 }
+    end
+
+    -- Anything unexpected becomes a string, so one odd value cannot abort the
+    -- encode for the whole match.
+    local function safe(v, depth)
+        depth = depth or 0
+        local t = type(v)
+        if t == 'number' then return num(v) or 0
+        elseif t == 'string' or t == 'boolean' then return v
+        elseif t == 'Vector3' or t == 'Vector2' then return tostring(v)
+        elseif t == 'table' and depth < 4 then
+            local out = {}
+            for k, x in pairs(v) do
+                local kt = type(k)
+                if kt == 'string' or kt == 'number' then
+                    local s = safe(x, depth + 1)
+                    if s ~= nil then out[k] = s end
+                end
+            end
+            return out
+        end
+        return nil
+    end
+
+    local function mkdir(path)
+        if type(makefolder) ~= 'function' or type(isfolder) ~= 'function' then return false end
+        pcall(function() if not isfolder(path) then makefolder(path) end end)
+        return true
+    end
+
+    local function writeText(path, text)
+        if type(writefile) ~= 'function' then return false, 'writefile missing' end
+        local ok, err = pcall(writefile, path, text)
+        return ok, err
+    end
+
+    local function writeJson(path, data)
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+        if not ok then
+            -- one retry through the sanitiser, so an unexpected datatype costs
+            -- the offending field instead of the whole match
+            local ok2, retry = pcall(function() return HttpService:JSONEncode(safe(data)) end)
+            if ok2 then return writeText(path, retry) end
+            return false, tostring(encoded)
+        end
+        return writeText(path, encoded)
+    end
+
+    local function dir()
+        return R.folder .. '/' .. R.session
+    end
+
+    local function directory_hint()
+        return 'writes to ' .. dir()
+    end
+
+    R.folderOk = mkdir(ROOT) and mkdir(dir())
+
+    ---------------------------------------------------------------- game probes
+
+    local function fighters()
+        if R.fc or R.fcTried then return R.fc end
+        R.fcTried = true
+        local ok, mod = pcall(function()
+            return require(LocalPlayer.PlayerScripts.Controllers.FighterController)
+        end)
+        if ok and type(mod) == 'table' then R.fc = mod end
+        return R.fc
+    end
+
+    local function duelState()
+        local fc = fighters()
+        if not fc then return nil end
+        local ok, f = pcall(function() return fc.LocalFighter end)
+        if not ok or type(f) ~= 'table' then return nil end
+        local ok2, v = pcall(function() return f:Get('IsInDuel') end)
+        if ok2 and type(v) == 'boolean' then return v end
+        return nil
+    end
+
+    -- Rivals does not expose equipped items as Tools, so the fighter object is
+    -- asked first and the character is only the fallback. Whichever path
+    -- answered is written into the match file, so the next build can drop the
+    -- paths that never fire.
+    local function probeLoadout(plr)
+        local names, source = {}, nil
+        local fc = fighters()
+        if fc then
+            local ok, fighter = pcall(function() return fc:GetFighter(plr) end)
+            if ok and type(fighter) == 'table' then
+                local ok2, items = pcall(function() return fighter:GetItems() end)
+                if ok2 and type(items) == 'table' then
+                    for k, v in pairs(items) do
+                        local n
+                        if type(v) == 'table' then
+                            n = v.Name or v.ItemName or v.name
+                        elseif type(k) == 'string' then
+                            n = k
+                        end
+                        if type(n) == 'string' then names[#names + 1] = n end
+                    end
+                    if #names > 0 then source = 'fighter' end
+                end
+            end
+        end
+        if #names == 0 then
+            local ch = plr.Character
+            if ch then
+                for _, c in ipairs(ch:GetChildren()) do
+                    if c:IsA('Tool') then names[#names + 1] = c.Name end
+                end
+                if #names > 0 then source = 'tools' end
+            end
+        end
+        table.sort(names)
+        return names, source
+    end
+
+    local function snapshotConfig()
+        local out = { toggles = {}, options = {} }
+        for k, o in pairs(Library.Toggles or {}) do
+            local ok, v = pcall(function() return o.Value end)
+            if ok then out.toggles[k] = safe(v) end
+        end
+        for k, o in pairs(Library.Options or {}) do
+            local ok, v = pcall(function() return o.Value end)
+            if ok then out.options[k] = safe(v) end
+        end
+        return out
+    end
+
+    ---------------------------------------------------------------- match state
+
+    local function push(tr, kind, detail)
+        local e = tr.events
+        if #e >= 200 then table.remove(e, 1) end
+        detail = detail or {}
+        detail.k = kind
+        detail.t = num(R.cur and R.cur.elapsed or 0)
+        e[#e + 1] = detail
+    end
+
+    local function newTrack(plr, t)
+        return {
+            name = plr.Name,
+            id = plr.UserId,
+            at = num(t),
+            samples = 0,
+            dist = 0,
+            speedMax = 0,
+            speedSum = 0,
+            yMax = 0, yMin = 0,
+            jumps = 0, bigJumps = 0, maxJump = 0,
+            spinDeg = 0, spinEvents = 0,
+            desync = 0,
+            highYSamples = 0,
+            weapons = {},
+            loadoutSource = nil,
+            hitsOnMe = 0,
+            killedMe = 0,
+            events = {},
+        }
+    end
+
+    local endMatch
+
+    local function startMatch(source)
+        R.matchIdx = R.matchIdx + 1
+        R.clock = os.clock()
+        local hrp = getRoot()
+        R.baselineY = hrp and hrp.Position.Y or 0
+
+        local names, lsrc = probeLoadout(LocalPlayer)
+        R.cur = {
+            index = R.matchIdx,
+            game = R.gameIdx,
+            session = R.session,
+            started = stamp(),
+            elapsed = 0,
+            detect = source,
+            myLoadout = { items = names, source = lsrc },
+            cfg = snapshotConfig(),
+            me = { name = LocalPlayer.Name, id = LocalPlayer.UserId,
+                   spawn = hrp and vec(hrp.Position) or nil },
+            players = {},
+            order = {},
+            hits = {},
+            result = nil,
+        }
+        R.status = string.format('match %d live', R.matchIdx)
+        bwDiag(string.format('rec: match %d start (%s)', R.matchIdx, tostring(source)))
+    end
+
+    local function mdFor(m)
+        local L = {}
+        local function add(s) L[#L + 1] = s end
+        add('# Banware match ' .. m.index .. ' (game ' .. m.game .. ')')
+        add('')
+        add('- started ' .. tostring(m.started) .. ' / ended ' .. tostring(m.ended))
+        add('- length ' .. tostring(m.elapsed) .. 's, detected by ' .. tostring(m.detect))
+        add('- result **' .. tostring(m.result) .. '** (' .. tostring(m.endReason) .. ')')
+        add('- my loadout: ' .. table.concat(m.myLoadout.items or {}, ', ')
+            .. ' [' .. tostring(m.myLoadout.source) .. ']')
+        if m.killedBy then
+            add('- killed by: ' .. tostring(m.killedBy.name) .. ' (' .. tostring(m.killedBy.weapon) .. ')')
+        end
+        add('')
+        add('## opponents')
+        for _, o in ipairs(m.opponents or {}) do
+            add('')
+            add('### ' .. tostring(o.name) .. ' (' .. tostring(o.id) .. ')')
+            add(string.format('- samples %d, distance travelled %.0f studs',
+                o.samples or 0, o.dist or 0))
+            add(string.format('- speed max %.0f / avg %.0f studs/s',
+                o.speedMax or 0,
+                (o.samples or 0) > 0 and ((o.speedSum or 0) / o.samples) or 0))
+            add(string.format('- jumps %d (over 200 studs %d, max %.0f)',
+                o.jumps or 0, o.bigJumps or 0, o.maxJump or 0))
+            add(string.format('- yaw change %.0f deg over %d samples',
+                o.spinDeg or 0, o.spinEvents or 0))
+            add(string.format('- altitude above match baseline: max %.0f / min %.0f',
+                o.yMax or 0, o.yMin or 0))
+            add('- loadout: ' .. table.concat(o.weapons or {}, ', ')
+                .. ' [' .. tostring(o.loadoutSource) .. ']')
+            add(string.format('- hits on me %d, killed me %d', o.hitsOnMe or 0, o.killedMe or 0))
+            local flags = {}
+            if (o.speedMax or 0) > 400 then flags[#flags + 1] = 'speed' end
+            if (o.spinDeg or 0) > 400 then flags[#flags + 1] = 'spinbot' end
+            if (o.desync or 0) > 0 then flags[#flags + 1] = 'desync' end
+            if (o.yMax or 0) > 200 then flags[#flags + 1] = 'altitude' end
+            if (o.bigJumps or 0) > 0 then flags[#flags + 1] = 'teleport jumps' end
+            add('- reads as: ' .. (#flags > 0 and table.concat(flags, ', ') or 'nothing flagged'))
+            local shown = 0
+            for _, e in ipairs(o.events or {}) do
+                if shown < 25 then
+                    local ok, line = pcall(function() return HttpService:JSONEncode(e) end)
+                    add('  - ' .. tostring(ok and line or e.k))
+                    shown = shown + 1
+                end
+            end
+        end
+        if #(m.hits or {}) > 0 then
+            add('')
+            add('## damage taken')
+            for i = 1, math.min(#m.hits, 25) do
+                local ok, line = pcall(function() return HttpService:JSONEncode(m.hits[i]) end)
+                add('- ' .. tostring(ok and line or '?'))
+            end
+        end
+        return table.concat(L, '\n')
+    end
+
+    local function writeMatch(m)
+        if not R.folderOk then
+            R.err = 'folder not writable'
+            return
+        end
+        local base = string.format('%s/m%02d', dir(), m.index)
+        local ok, err = writeJson(base .. '.json', m)
+        if not ok then R.err = 'json: ' .. tostring(err) end
+        writeText(base .. '.md', mdFor(m))
+    end
+
+    local function writeGame()
+        if not R.folderOk then return end
+        local g = {
+            game = R.gameIdx,
+            session = R.session,
+            written = stamp(),
+            matches = R.gameMatches,
+        }
+        writeJson(string.format('%s/game%02d.json', dir(), R.gameIdx), g)
+        writeJson(string.format('%s/session.json', dir()), {
+            session = R.session,
+            matches = R.matchIdx,
+            games = R.gameIdx,
+            last = R.status,
+        })
+    end
+
+    endMatch = function(result, reason)
+        local m = R.cur
+        if not m then return end
+        m.elapsed = num(os.clock() - R.clock)
+        m.result = result
+        m.endReason = reason
+        m.ended = stamp()
+
+        local arr = {}
+        for i = 1, #m.order do
+            local tr = m.players[m.order[i]]
+            if tr and tr.samples > 0 then
+                -- Vector3 fields are live state, not data, and JSONEncode
+                -- refuses them; dropping them here keeps the whole match
+                -- writable instead of losing it to one field
+                tr.lastPos = nil
+                tr.lastFacing = nil
+                tr.prevJumpPos = nil
+                tr.lastT = nil
+                arr[#arr + 1] = tr
+            end
+        end
+        m.opponents = arr
+        m.players = nil
+        m.order = nil
+
+        R.cur = nil
+        R.status = string.format('match %d %s (%s)', m.index, tostring(result), tostring(reason))
+        writeMatch(m)
+
+        R.gameMatches[#R.gameMatches + 1] = {
+            index = m.index,
+            result = m.result,
+            reason = m.endReason,
+            length = m.elapsed,
+            killedBy = m.killedBy and m.killedBy.name or nil,
+            opponents = (function()
+                local names = {}
+                for i = 1, #arr do
+                    names[i] = arr[i].name
+                end
+                return names
+            end)(),
+        }
+
+        if #R.gameMatches >= 5 then
+            writeGame()
+            R.gameIdx = R.gameIdx + 1
+            R.gameMatches = {}
+        else
+            writeJson(string.format('%s/session.json', dir()), {
+                session = R.session,
+                matches = R.matchIdx,
+                games = R.gameIdx,
+                last = R.status,
+            })
+        end
+        bwDiag('rec: ' .. R.status)
+    end
+
+    ---------------------------------------------------------------- tracking
+
+    local function tickTrack(tr, rp, t)
+        local p = rp.Position
+        tr.samples = tr.samples + 1
+
+        if tr.lastPos then
+            local d = (p - tr.lastPos).Magnitude
+            local dt = math.max(t - (tr.lastT or t), 1e-3)
+            local sp = d / dt
+            tr.speedSum = tr.speedSum + sp
+            if sp > tr.speedMax then tr.speedMax = sp end
+            tr.dist = tr.dist + d
+            if d > tr.maxJump then tr.maxJump = d end
+            if d > 40 then
+                tr.jumps = tr.jumps + 1
+                if d > 200 then
+                    tr.bigJumps = tr.bigJumps + 1
+                    push(tr, 'jump', { from = vec(tr.lastPos), to = vec(p), d = num(d) })
+                    -- a big jump followed by a return to roughly where the body
+                    -- already was is the desync signature, not a teleport
+                    if tr.prevJumpPos and (p - tr.prevJumpPos).Magnitude < 20 then
+                        tr.desync = tr.desync + 1
+                        push(tr, 'desync', { back = vec(p) })
+                    end
+                    tr.prevJumpPos = tr.lastPos
+                end
+            end
+            if sp > 280 then
+                push(tr, 'fast', { speed = num(sp) })
+            end
+        end
+
+        local look = rp.CFrame.LookVector
+        if tr.lastFacing then
+            local dot = math.clamp(look:Dot(tr.lastFacing), -1, 1)
+            local ang = math.deg(math.acos(dot))
+            if ang > 45 then
+                tr.spinDeg = tr.spinDeg + ang
+                tr.spinEvents = tr.spinEvents + 1
+                if tr.spinEvents % 8 == 0 then
+                    push(tr, 'spin', { deg = num(ang) })
+                end
+            end
+        end
+        tr.lastFacing = look
+        tr.lastPos = p
+        tr.lastT = t
+
+        local relY = p.Y - R.baselineY
+        if relY > tr.yMax then tr.yMax = relY end
+        if relY < tr.yMin then tr.yMin = relY end
+        if relY > 250 then tr.highYSamples = tr.highYSamples + 1 end
+
+        local h = rp.Parent and rp.Parent:FindFirstChildOfClass('Humanoid')
+        tr.now = {
+            pos = vec(p),
+            vel = vec(rp.AssemblyLinearVelocity),
+            look = vec(look),
+            move = h and vec(h.MoveDirection) or nil,
+            walk = h and num(h.WalkSpeed) or nil,
+            hp = h and num(h.Health) or nil,
+        }
+        tr.endPos = vec(p)
+    end
+
+    local function onDamage(dmg, hp)
+        local m = R.cur
+        if not m then return end
+        local myRoot = getRoot()
+        if not myRoot then return end
+        local my = myRoot.Position
+
+        local best, bestScore, bestInfo = nil, -1, nil
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local tr = m.players[plr.UserId]
+                local ch = plr.Character
+                local rp = ch and ch:FindFirstChild('HumanoidRootPart')
+                local h = ch and ch:FindFirstChildOfClass('Humanoid')
+                if tr and rp and h and h.Health > 0 then
+                    local d = (rp.Position - my).Magnitude
+                    if d <= 800 then
+                        local off = my - rp.Position
+                        local dirv = off.Magnitude > 0.001 and off.Unit or Vector3.zero
+                        local dot = math.clamp(rp.CFrame.LookVector:Dot(dirv), -1, 1)
+                        local ang = math.deg(math.acos(dot))
+                        local score = (1 - d / 800) * (ang < 60 and 1 or 0.15)
+                        if score > bestScore then
+                            bestScore, best = score, plr
+                            bestInfo = { d = num(d), ang = num(ang) }
+                        end
+                    end
+                end
+            end
+        end
+
+        local rec = { t = num(os.clock() - R.clock), dmg = num(dmg), hp = num(hp) }
+        if best and bestInfo then
+            local tr = m.players[best.UserId]
+            tr.hitsOnMe = tr.hitsOnMe + 1
+            rec.by = best.Name
+            rec.dist = bestInfo.d
+            rec.angle = bestInfo.ang
+            if bestInfo.ang > 60 then
+                rec.silentaim = true
+                push(tr, 'silentaim', { angle = bestInfo.ang, dist = bestInfo.d })
+            end
+            if hp <= 0 then
+                tr.killedMe = tr.killedMe + 1
+                rec.killed = true
+                m.killedBy = { name = best.Name, id = best.UserId,
+                    weapon = table.concat(tr.weapons or {}, ','), dist = bestInfo.d }
+            end
+        end
+        m.hits[#m.hits + 1] = rec
+        if #m.hits > 200 then table.remove(m.hits, 1) end
+
+        if hp <= 0 then endMatch('loss', 'died') end
+    end
+
+    local function hookHum(h)
+        if R.hookHum == h then return end
+        R.hookHum = h
+        R.prevHealth = h and h.Health or 0
+        if not h then return end
+        h.HealthChanged:Connect(function(v)
+            local prev = R.prevHealth or v
+            R.prevHealth = v
+            if v >= prev then return end
+            pcall(onDamage, prev - v, v)
+        end)
+    end
+
+    local function sample(step)
+        local m = R.cur
+        if not m then return end
+        m.elapsed = num(os.clock() - R.clock)
+        local t = m.elapsed
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local ch = plr.Character
+                local rp = ch and ch:FindFirstChild('HumanoidRootPart')
+                local h = ch and ch:FindFirstChildOfClass('Humanoid')
+                if rp and h and h.Health > 0 then
+                    local tr = m.players[plr.UserId]
+                    if not tr then
+                        tr = newTrack(plr, t)
+                        m.players[plr.UserId] = tr
+                        m.order[#m.order + 1] = plr.UserId
+                        local names, src = probeLoadout(plr)
+                        tr.weapons = names
+                        tr.loadoutSource = src
+                    end
+                    tickTrack(tr, rp, t)
+                end
+            end
+        end
+        m.sampled = (m.sampled or 0) + 1
+    end
+
+    ---------------------------------------------------------------- control
+
+    local function control(dt)
+        if not R.on then return end
+
+        local ch = LocalPlayer.Character
+        local h = ch and ch:FindFirstChildOfClass('Humanoid')
+        hookHum(h)
+
+        local alive = h ~= nil and h.Health > 0
+        local dead = h ~= nil and h.Health <= 0
+        local duel = duelState()
+
+        -- proximity is only consulted when the duel flag cannot be read
+        local near = false
+        local myRoot = getRoot()
+        if myRoot then
+            local my = myRoot.Position
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LocalPlayer then
+                    local pc = plr.Character
+                    local pr = pc and pc:FindFirstChild('HumanoidRootPart')
+                    local ph = pc and pc:FindFirstChildOfClass('Humanoid')
+                    if pr and ph and ph.Health > 0 and (pr.Position - my).Magnitude < 400 then
+                        near = true
+                        break
+                    end
+                end
+            end
+        end
+
+        if near then R.nearT = R.nearT + dt else R.idleT = R.idleT + dt end
+        if near then R.idleT = 0 else R.nearT = 0 end
+
+        local source, inMatch
+        if duel ~= nil then
+            inMatch = duel and alive
+            source = 'IsInDuel'
+        else
+            inMatch = near and alive and R.nearT > 1.5
+            source = 'proximity'
+        end
+
+        if not R.cur then
+            if inMatch then startMatch(source) end
+        elseif dead then
+            endMatch('loss', 'died')
+        elseif duel == false then
+            endMatch('win', 'duel ended alive')
+        elseif duel == nil and not near and R.idleT > 4 then
+            endMatch('win', 'no contact for 4s')
+        elseif (R.cur.elapsed or 0) > 900 then
+            endMatch('unknown', 'timeout')
+        end
+
+        if R.cur then
+            R.acc = R.acc + dt
+            local step = 1 / math.max(R.hz, 1)
+            if R.acc >= step then
+                R.acc = 0
+                pcall(sample, step)
+            end
+        end
+
+        if RecLabel and (R.tick or 0) % 30 == 0 then
+            pcall(function() RecLabel:SetText(R.status) end)
+        end
+        R.tick = (R.tick or 0) + 1
+    end
+
+    ---------------------------------------------------------------- UI
+
+    local armed = false
+    local Box = Tabs.Settings:AddLeftGroupbox('Match Recorder')
+
+    Box:AddToggle('RecEnabled', {
+        Text = 'Record Matches',
+        Default = true,
+        Tooltip = 'Writes one JSON + one Markdown file per match under Banware/matches.',
+        Callback = function(v)
+            if not armed then return end
+            R.on = v
+            Library:Notify(v and 'recorder on' or 'recorder off', 2)
+        end,
+    })
+
+    Box:AddSlider('RecHz', {
+        Text = 'Sample Rate',
+        Default = 10,
+        Min = 1,
+        Max = 30,
+        Rounding = 0,
+        Unit = ' Hz',
+        Callback = function(v) R.hz = v end,
+    })
+
+    Box:AddButton({
+        Text = 'Write Current Match Now',
+        Func = function()
+            if R.cur then
+                endMatch('unknown', 'manual')
+            else
+                Library:Notify('no match running', 2)
+            end
+        end,
+    })
+
+    Box:AddButton({
+        Text = 'Clear Last Status',
+        Func = function()
+            R.status = 'idle'
+        end,
+    })
+
+    RecLabel = Box:AddLabel('idle')
+    Box:AddLabel(directory_hint(), true)
+    armed = true
+
+    -- One frame loop for the whole recorder. Detection runs every frame so a
+    -- death is caught in the frame it lands; sampling is rate limited inside
+    -- control() and timestamps come from os.clock, so a frame spike inflates
+    -- the interval instead of the speed.
+    RunService.Heartbeat:Connect(function(dt)
+        if not R.on then return end
+        local ok, err = pcall(control, dt)
+        if not ok then
+            R.err = tostring(err)
+            bwDiag('rec: control error ' .. tostring(err))
+        end
+    end)
+
+    getgenv().BanwareRecorder = R
+end
+
+__bwRecorder()
 
 Library:SetWatermarkVisibility(false)
 
@@ -6318,47 +7342,46 @@ local function MakeMobileButton(name, text, y)
     return btn
 end
 
-local ToggleBtn = MakeMobileButton("ToggleUI", "Toggle UI", 0)
-local LockBtn = MakeMobileButton("LockUI", "Unlock UI", 40)
+local ui = { visible = true, locked = false }
+ui.toggle = MakeMobileButton("ToggleUI", "Toggle UI", 0)
+ui.lock = MakeMobileButton("LockUI", "Unlock UI", 40)
 
-local menuVisible = true
-local uiLocked = false
-
-ToggleBtn.MouseButton1Click:Connect(function()
-    menuVisible = not menuVisible
+ui.toggle.MouseButton1Click:Connect(function()
+    ui.visible = not ui.visible
     pcall(function()
         local holder = Library.Window and Library.Window.Holder
-        if holder then holder.Visible = menuVisible end
+        if holder then holder.Visible = ui.visible end
     end)
-    ToggleBtn.Text = menuVisible and "Toggle UI" or "Show UI"
+    ui.toggle.Text = ui.visible and "Toggle UI" or "Show UI"
 end)
 
-LockBtn.MouseButton1Click:Connect(function()
-    uiLocked = not uiLocked
+ui.lock.MouseButton1Click:Connect(function()
+    ui.locked = not ui.locked
     -- CanDrag is what the library's drag handler reads, so this is the real lock.
-    pcall(function() Library.CanDrag = not uiLocked end)
-    LockBtn.Text = uiLocked and "Lock UI" or "Unlock UI"
-    Library:Notify(uiLocked and "UI Locked" or "UI Unlocked", 1.5)
+    pcall(function() Library.CanDrag = not ui.locked end)
+    ui.lock.Text = ui.locked and "Lock UI" or "Unlock UI"
+    Library:Notify(ui.locked and "UI Locked" or "UI Unlocked", 1.5)
 end)
 
 do
-    local dragging, dragStart, startPos
+    -- one table instead of three locals: the chunk is at the register ceiling
+    local drag = { on = false, start = nil, pos = nil }
     ButtonHolder.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = ButtonHolder.Position
+            drag.on = true
+            drag.start = input.Position
+            drag.pos = ButtonHolder.Position
         end
     end)
     ButtonHolder.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
+            drag.on = false
         end
     end)
     UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local delta = input.Position - dragStart
-            ButtonHolder.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        if drag.on and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - drag.start
+            ButtonHolder.Position = UDim2.new(drag.pos.X.Scale, drag.pos.X.Offset + delta.X, drag.pos.Y.Scale, drag.pos.Y.Offset + delta.Y)
         end
     end)
 end
