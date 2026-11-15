@@ -12,7 +12,7 @@ local CollectionService = game:GetService("CollectionService")
 local LocalPlayer = Players.LocalPlayer
 local isMobile = UserInputService.TouchEnabled
 
--- Executing while a queue is still loading is the normal way this gets run, and 
+-- Executing while a queue is still loading is the normal way this gets run, and
 -- at that moment the player object is nil and the character has not replicated.
 -- Everything below assumes both, so a boot against that state half-builds the
 -- menu over a game whose own UI has not come up yet - which reads as an empty
@@ -40,7 +40,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-28"
+local BANWARE_BUILD = "v2-util-29"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -990,16 +990,18 @@ end
 -- translocate (63817), uekiller (64151). Each mode answers one question Ã¢â‚¬â€
 -- given the body's real CFrame, where does the server need to believe it is.
 local HIDE = {
-    ugPos = nil, ugAt = 0, ugHold = 0, ugParams = nil,
-    tlPos = nil, tlAt = 0, tlPart = nil, tlCap = 300, tlMin = 10000,
+    ugPos = nil, ugAt = 0, ugParams = nil,
+    tlPos = nil, tlAt = 0, tlPart = nil, tlCap = 300,
     ueY = 0, ueAt = 0,
     auRing = nil, auAt = 0,
     vjPos = nil, vjAt = 0,
     seatY = nil, seatX = nil, seatZ = nil,
+    pin = false, home = nil, moved = false,
 }
 
 local function resetHide()
-    HIDE.ugPos, HIDE.ugAt, HIDE.ugHold = nil, 0, 0
+    HIDE.ugPos, HIDE.ugAt = nil, 0
+    HIDE.pin = false
     HIDE.tlPos, HIDE.tlAt, HIDE.tlCap = nil, 0, 300
     HIDE.ueY, HIDE.ueAt = 0, 0
     HIDE.auRing, HIDE.auAt = nil, 0
@@ -1087,21 +1089,22 @@ end
 
 -- kicia Underground: one 512-stud drop from two studs above the root, sit
 -- `depth` below the first surface found, never below the kill plane, and never
--- accept a result that has not actually gone under. Re-scanned at most four
--- times a second so the raycast costs nothing on the frames that skip it.
+-- accept a result that has not actually gone under.
+--
+-- The write replicates, so the body really is under the floor and nothing holds
+-- it there. The previous build handed the truth back for 0.45 s out of every
+-- 0.8 s; the body spent that window in free fall, then the next re-scan snapped
+-- it back up to the configured depth - which is the drop-and-jump-back you were
+-- watching. One lie is now held for as long as the mode is armed, the scan casts
+-- from the last surface the body stood on (once under the map there is nothing
+-- below the body to find), and a body that cannot find a floor is put back on
+-- the surface instead of being left to sink. Standing still is done in voidStep:
+-- the CFrame is rewritten every frame, and the assembly velocity is zeroed on
+-- the same frame, because re-writing the position does not remove the
+-- acceleration that gravity already put into it.
 local function hideUnderground(realCF)
     local now = os.clock()
-    -- A permanent under-floor lie is what made the body fall. The write
-    -- replicates (env log: fflag=true), so the server keeps the fake; the
-    -- assembly then has no floor under it and the kill plane is NaN, so nothing
-    -- ever catches the drop. Instead the body sits under the floor for a short
-    -- pulse and is handed its real position back between pulses: one write of
-    -- the truth per cycle re-syncs the server instead of letting it pull the
-    -- assembly down for as long as the mode stays armed.
-    if HIDE.ugPos and now < HIDE.ugAt then
-        if now < HIDE.ugHold then return HIDE.ugPos end
-        return realCF
-    end
+    if HIDE.ugPos and now < HIDE.ugAt then return HIDE.ugPos end
 
     if not HIDE.ugParams then
         HIDE.ugParams = RaycastParams.new()
@@ -1112,13 +1115,19 @@ local function hideUnderground(realCF)
     HIDE.ugParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
 
     local pos = realCF.Position
-    local hit = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -512, 0), HIDE.ugParams)
-    HIDE.ugAt = now + 0.8
-    HIDE.ugHold = now + 0.35
+    local baseY = pos.Y
+    if HIDE.seatY and baseY < HIDE.seatY - 4 then baseY = HIDE.seatY end
+    local origin = Vector3.new(pos.X, baseY + 2, pos.Z)
+
+    HIDE.ugAt = now + 0.5
+    local hit = workspace:Raycast(origin, Vector3.new(0, -512, 0), HIDE.ugParams)
     if not hit then
-        -- no surface inside 512 studs: the body is already below the map, so
-        -- write the truth back rather than leaving the last fake standing
-        HIDE.ugPos = nil
+        -- no surface to hide under: keep the lie that is already holding, and a
+        -- body with nothing cached goes back to the surface. Returning the
+        -- falling body is what left it sinking for the rest of the session,
+        -- because the env write has disabled the kill plane.
+        if HIDE.ugPos then return HIDE.ugPos end
+        if baseY ~= pos.Y then return realCF + Vector3.new(0, baseY - pos.Y, 0) end
         return realCF
     end
 
@@ -1128,12 +1137,18 @@ local function hideUnderground(realCF)
     if floor ~= floor then floor = targetY end
     local y = math.max(targetY, floor)
 
-    if y > hit.Position.Y - 5 or y < pos.Y - 64 then
-        HIDE.ugPos = nil
+    -- a surface thinner than the requested depth lands the target inside the
+    -- floor; hold the deepest point that is still under it
+    if y > hit.Position.Y - 5 then y = hit.Position.Y - 5 end
+
+    -- a drop that large from a body with no known surface is the world, not a
+    -- floor. Refuse the write rather than bet the session on it.
+    if y < pos.Y - 64 and not HIDE.seatY then
+        if HIDE.ugPos then return HIDE.ugPos end
         return realCF
     end
 
-    local out = realCF + Vector3.new(0, y - pos.Y, 0)
+    local out = CFrame.new(pos.X, y, pos.Z) * (realCF - realCF.Position)
     HIDE.ugPos = out
     return out
 end
@@ -1383,35 +1398,41 @@ end)()
 -- body is not standing on is a larger lie every frame and buys nothing.
 local function hideTranslocate(realCF, withSwing)
     local now = os.clock()
+    -- The anchor is sticky on purpose. Kicia recomputes its point every frame,
+    -- but it pushes the point through its own SetServerCFrame, where the local
+    -- body never moves. Banware writes the root, so a fresh random ring cell
+    -- four times a second is four 1e8-stud teleports a second: the camera
+    -- whips, streaming churns and the game drags the body back each time. One
+    -- anchor holds until it is a minute old or the grid under it is gone.
     if not HIDE.tlPos or now >= HIDE.tlAt then
-        HIDE.tlAt = now + 0.25
+        HIDE.tlAt = now + 60
         local gated = CFG.TL_GATE ~= false
         local has = (not gated) or TL.hasTarget()
         local part = has and TL.part() or nil
         if part then
             local offset = math.clamp(CFG.TL_OFFSET, -5, 5)
             HIDE.tlPos = part.CFrame * CFrame.new(0, -part.Size.Y / 2 + offset, 0)
-            HIDE.tlTag = 'brick'
             -- the anchor only holds while the body stays under the brick. A
             -- lateral swing bigger than half its footprint walks out from under
             -- it and the server has nothing legal to accept, which is why the
             -- 5000-stud setting never held.
             HIDE.tlCap = math.max(0, math.min(part.Size.X, part.Size.Z) / 2 - 2)
 
-            -- Kicia's no-target branch is a 10,000..1e9 shell; the brick is not.
-            -- It sits near the arena, so a brick anchor lands a few hundred
-            -- studs away - inside a desynced opponent's reach, which is exactly
-            -- the 343-stud Chainsaw kill logged in 20260215-220259/m02. Anything
-            -- nearer than the shell floor is not a hide, so the ring takes it.
-            local d = (HIDE.tlPos.Position - realCF.Position).Magnitude
-            if d < (HIDE.tlMin or 10000) then
-                HIDE.tlPos = RING.point()
-                HIDE.tlTag = string.format('brick %.0f away - ring', d)
-                HIDE.tlCap = 300
-            end
+            -- The brick is used at whatever distance it sits, because that is
+            -- exactly what the game's own evasion does (jK / fn35 in the dump:
+            -- the KillDelay == 0 OutOfBoundsPart is taken with no distance
+            -- check at all, and the 10000..1e9 shell is only the no-brick
+            -- fallback). Rejecting it for being nearer than 10,000 studs threw
+            -- away the one anchor known to hold and substituted a ring cell,
+            -- which is the teleport that pulled the body out of the map.
+            HIDE.tlTag = string.format('brick %.0f away', (HIDE.tlPos.Position - realCF.Position).Magnitude)
         else
-            HIDE.tlPos = RING.point()
-            HIDE.tlTag = gated and 'no target - ring' or 'no brick - ring'
+            -- no brick in the collection: this is Kicia's no-target shell,
+            -- 10,000..1e9 studs from the body. It is a real teleport the game
+            -- will drag the body back from, so it is the last resort and the
+            -- status line says so.
+            HIDE.tlPos = RING.point(nil, 0)
+            HIDE.tlTag = gated and 'no target - shell' or 'no brick - shell'
             HIDE.tlCap = 300
         end
     end
@@ -1712,6 +1733,14 @@ local function hideAntiUE(realCF)
 end
 
 local function hidePosition(realCF, withSwing)
+    local mode = CFG.HIDE_MODE
+    -- Pinned modes move the real body to a place that has no floor under it, so
+    -- gravity starts pulling immediately. The legacy offset mode is the only one
+    -- that is meant to drift, so it is the only one left unpinned.
+    HIDE.pin = CFG.ANTIUE == true
+        or mode == 'Underground' or mode == 'Translocate'
+        or mode == 'Random' or mode == 'UEKiller'
+
     -- the counter outranks the hide modes: if we are fighting an altitude
     -- spammer, being in the void is not the answer
     if CFG.ANTIUE then
@@ -1719,7 +1748,6 @@ local function hidePosition(realCF, withSwing)
         if au then return au end
     end
 
-    local mode = CFG.HIDE_MODE
     if mode == 'Underground' then
         return hideUnderground(realCF)
     elseif mode == 'Translocate' then
@@ -1768,27 +1796,33 @@ local function voidStep(dt)
     -- is that. Seat is the highest point the real body has stood at; 150 studs
     -- under it is not movement, it is the lie having been accepted and the
     -- server dragging the assembly down. Put the body back and drop the cache.
+    --
+    -- Pinned modes are skipped: while one is armed the body is being held where
+    -- it did not walk to (a ring anchor at Y 1e8), so a ring height would become
+    -- the seat and drag the body back into the ring the frame the mode came off.
     local py = realCF.Position.Y
-    -- only a sane surface height is worth seating on: a body that is already
-    -- sunk (a previous run, or an execute that landed mid-fall) would otherwise
-    -- pin the seat at -1e6 and the watchdog would never see a fall again
-    if py > -1000 and (not HIDE.seatY or py > HIDE.seatY) then
-        HIDE.seatY, HIDE.seatX, HIDE.seatZ = py, realCF.Position.X, realCF.Position.Z
-    end
-    if HIDE.seatY and py < HIDE.seatY - 150 then
-        pcall(function()
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.CFrame = CFrame.new(HIDE.seatX, HIDE.seatY, HIDE.seatZ)
-            -- the game hides the hotbar and the round UI the moment a body is
-            -- out of bounds; putting the body back is not enough on its own
-            game:GetService('StarterGui'):SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
-        end)
-        HIDE.ugPos, HIDE.ugHold, HIDE.ugAt = nil, 0, 0
-        HIDE.ueY = 0
-        HIDE.vjPos = nil
-        V.old = nil
-        bwDiag(string.format('void: fall caught at %.0f, reseated %.0f', py, HIDE.seatY))
-        return
+    if not HIDE.pin then
+        -- only a sane surface height is worth seating on: a body that is already
+        -- sunk (a previous run, or an execute that landed mid-fall) would
+        -- otherwise pin the seat at -1e6 and never see a fall again
+        if py > -1000 and (not HIDE.seatY or py > HIDE.seatY) then
+            HIDE.seatY, HIDE.seatX, HIDE.seatZ = py, realCF.Position.X, realCF.Position.Z
+        end
+        if HIDE.seatY and py < HIDE.seatY - 150 then
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(HIDE.seatX, HIDE.seatY, HIDE.seatZ)
+                -- the game hides the hotbar and the round UI the moment a body
+                -- is out of bounds; putting the body back is not enough
+                game:GetService('StarterGui'):SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+            end)
+            HIDE.ugPos, HIDE.ugAt = nil, 0
+            HIDE.ueY = 0
+            HIDE.vjPos = nil
+            V.old = nil
+            bwDiag(string.format('void: fall caught at %.0f, reseated %.0f', py, HIDE.seatY))
+            return
+        end
     end
 
     -- Translocate asks the question the other modes do not: is the server
@@ -1818,6 +1852,20 @@ local function voidStep(dt)
         V.old = realCF
         V.fake = fake
         writeFake(hrp, fake)
+        -- A root write moves the real body, so gravity is already acting on it
+        -- the frame the lie lands. Rewriting the CFrame each frame re-pins the
+        -- position but not the velocity, so the body keeps accelerating under
+        -- the write and the rendered position sags further every frame - that
+        -- sag is the "goes down a bunch then snaps back" on underground. Zeroing
+        -- the assembly velocity on the same frame is what makes the lie stand
+        -- still, and it also stops the body launching when the mode is released.
+        if HIDE.pin then
+            HIDE.moved = true
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
     end
 
     V.tick = (V.tick or 0) + 1
@@ -1856,9 +1904,26 @@ end
 function startVoid()
     killConn("void")
     local hrp = getRoot()
-    if hrp then originalPos = hrp.Position end
+    if hrp then
+        originalPos = hrp.Position
+        -- The address the body really stood on when the mode was armed. A
+        -- root-write hide moves the real character to a place it cannot walk
+        -- back from, so this is the only position guaranteed safe when the mode
+        -- comes off.
+        HIDE.home = hrp.CFrame
+        -- Seed the surface cache now, before the first lie lands. hideUnderground
+        -- casts downward from the seat, and while a pinned mode is running the
+        -- watchdog is skipped, so this is the only moment the real surface
+        -- height is still on the root.
+        if hrp.Position.Y > -1000 and not HIDE.seatY then
+            HIDE.seatY, HIDE.seatX, HIDE.seatZ =
+                hrp.Position.Y, hrp.Position.X, hrp.Position.Z
+        end
+    end
+    HIDE.moved = false
     elapsed = 0
     resetHide()
+    HIDE.pin = false
     V.old = nil
     V.envOn()
     pcall(function() RunService:UnbindFromRenderStep('BanwareVoidRestore') end)
@@ -1882,6 +1947,23 @@ function stopVoid()
     TL.release()
     V.old, V.fake = nil, nil
     V.envOff()
+    -- Hand the body back. Without this, switching a pinned mode off leaves the
+    -- player standing in the ring at 1e8 studs - or under the map - with the
+    -- kill plane still NaN and no way home, which is the stranding that made the
+    -- old translocate unusable.
+    local home, moved = HIDE.home, HIDE.moved
+    HIDE.home, HIDE.moved, HIDE.pin = nil, false, false
+    if moved and home then
+        pcall(function()
+            local root = getRoot()
+            if not root then return end
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = home
+            game:GetService('StarterGui'):SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+            bwDiag(string.format('void: released back to %.0f %.0f %.0f',
+                home.X, home.Y, home.Z))
+        end)
+    end
     resetHide()
     originalPos = nil
 end
@@ -6974,6 +7056,7 @@ if configSectionLoaded then
             and BWP.byId[name:sub(2)] then
             name = name:sub(2)
         end
+        if name == nil or name == 'none' then return end
         if name and name ~= 'none' and BWP.byId[name] then
             local ok, n = pcall(BWP.apply, BWP.byId[name])
             if ok then
@@ -6985,12 +7068,81 @@ if configSectionLoaded then
             return
         end
 
-        local success, err = pcall(function()
-            SaveManager:LoadAutoloadConfig()
-        end)
+        -- Own config applier.
+        --
+        -- SaveManager:Load spawns one task per option and swallows every error
+        -- raised inside it, so a config that half-applies still reports success.
+        -- The match logs showed exactly that: autoload was "nif", and every void
+        -- option was sitting at its UI default - hide off, mode Void Jump, depth
+        -- 10, radius 200, climb 10000 - while nif.json on disk says hide on,
+        -- Underground, depth 10, climb 1000. The hide was therefore never armed
+        -- in seven consecutive matches, which is why none of the retuning in the
+        -- presets was ever exercised.
+        --
+        -- This reads the same file and drives the option objects directly:
+        -- options first, toggles last, because a toggle callback reads the
+        -- values around it (startVoid reads the hide mode the moment it runs).
+        -- Whatever cannot be applied is named instead of vanishing.
+        local function applyConfigFile(cfgName)
+            local path = 'Banware/configs/settings/' .. cfgName .. '.json'
+            if type(isfile) == 'function' and not isfile(path) then
+                return false, 'no such config: ' .. cfgName
+            end
+            local okR, raw = pcall(readfile, path)
+            if not okR or type(raw) ~= 'string' then return false, 'read failed' end
+            local okD, decoded = pcall(function()
+                return game:GetService('HttpService'):JSONDecode(raw)
+            end)
+            if not okD or type(decoded) ~= 'table' or type(decoded.objects) ~= 'table' then
+                return false, 'decode failed'
+            end
 
-        if not success then
-            warn("[Banware] Autoload failed: " .. tostring(err))
+            local function one(o)
+                if type(o) ~= 'table' or type(o.idx) ~= 'string' then return false end
+                if o.type == 'ColorPicker' then
+                    local opt = optRef(o.idx)
+                    if not opt or not opt.SetValueRGB or type(o.value) ~= 'string' then return false end
+                    return (pcall(function()
+                        opt:SetValueRGB(Color3.fromHex(o.value), o.transparency)
+                    end))
+                end
+                local value = o.value
+                if o.type == 'Slider' then value = tonumber(o.value) or o.value end
+                if o.type == 'Input' then value = o.text end
+                if o.type == 'KeyPicker' then value = { o.key, o.mode, o.modifiers } end
+                if value == nil then return false end
+                return setOpt(o.idx, value)
+            end
+
+            local applied, dropped, names = 0, 0, {}
+            local function pass(wantToggle)
+                for i = 1, #decoded.objects do
+                    local o = decoded.objects[i]
+                    if type(o) == 'table' and ((o.type == 'Toggle') == wantToggle) then
+                        if one(o) then
+                            applied = applied + 1
+                        else
+                            dropped = dropped + 1
+                            if #names < 10 then names[#names + 1] = tostring(o.idx) end
+                        end
+                    end
+                end
+            end
+            pass(false)
+            pass(true)
+            bwDiag(string.format('autoload: %s applied %d dropped %d%s', tostring(cfgName), applied,
+                dropped, dropped > 0 and (' [' .. table.concat(names, ', ') .. ']') or ''))
+            return true, applied, dropped
+        end
+
+        local okC, applied, dropped = applyConfigFile(name)
+        if okC then
+            Library:Notify(string.format('Auto loaded %q - %d options%s', tostring(name),
+                applied or 0,
+                (dropped or 0) > 0 and string.format(', %d not restored', dropped) or ''), 5)
+        else
+            bwDiag('autoload: ' .. tostring(applied))
+            warn('[Banware] autoload failed: ' .. tostring(applied))
         end
     end)
 end
@@ -7032,6 +7184,7 @@ local __bwRecorder = function()
         prevHealth = 0,
         nearT = 0,
         idleT = 0,
+        duelLast = nil,
         err = nil,
     }
 
@@ -7862,6 +8015,21 @@ local __bwRecorder = function()
                 end
             end
         end
+        -- The fighter object is not alive yet at the frame a match is detected,
+        -- so the loadout captured in startMatch is usually empty - six of the
+        -- last seven matches recorded "[nil]". Retry while it is empty instead
+        -- of writing a blank into the file.
+        if #(m.myLoadout.items or {}) == 0 or m.myLoadout.equip == nil then
+            local names, src = probeLoadout(LocalPlayer)
+            if #names > 0 then
+                m.myLoadout.items = names
+                m.myLoadout.source = src
+            end
+            if m.myLoadout.equip == nil then
+                m.myLoadout.equip = equippedOf(LocalPlayer)
+            end
+        end
+
         m.sampled = (m.sampled or 0) + 1
     end
 
@@ -7888,7 +8056,7 @@ local __bwRecorder = function()
                     local pc = plr.Character
                     local pr = pc and pc:FindFirstChild('HumanoidRootPart')
                     local ph = pc and pc:FindFirstChildOfClass('Humanoid')
-                    if pr and ph and ph.Health > 0 and (pr.Position - my).Magnitude < 400 then
+                    if pr and ph and ph.Health > 0 and (pr.Position - my).Magnitude < 1200 then
                         near = true
                         break
                     end
@@ -7901,6 +8069,10 @@ local __bwRecorder = function()
 
         local source, inMatch
         if duel ~= nil then
+            -- sticky: LocalFighter goes nil on respawn, on the result screen and
+            -- whenever the client desyncs, and a single nil frame used to drop
+            -- the whole match into the proximity fallback
+            R.duelLast = duel
             inMatch = duel and alive
             source = 'IsInDuel'
         else
@@ -7914,12 +8086,14 @@ local __bwRecorder = function()
             endMatch('loss', 'died')
         elseif duel == false then
             endMatch('win', 'duel ended alive')
-        elseif duel == nil and not near and R.idleT > 4 then
-            -- proximity fallback: the duel flag was never readable this
-            -- session, so there is no result to claim. Recording this as a win
-            -- is what made two losses look like victories in the first set of
-            -- logs.
-            endMatch('unknown', 'lost contact (proximity)')
+        elseif duel == nil and not near and R.idleT > 120 then
+            -- The duel flag is unreachable this session (fighter nil, or the
+            -- client is desynced) and nothing has been seen for two minutes.
+            -- Four seconds used to be enough here, which is why six of seven
+            -- recent matches ended as "lost contact" the moment the opponent
+            -- teleported out of the 400-stud proximity radius.
+            endMatch('unknown', string.format('no contact for %.0fs (duel flag unreachable)',
+                math.floor(R.idleT)))
         elseif (R.cur.elapsed or 0) > 900 then
             endMatch('unknown', 'timeout')
         end
