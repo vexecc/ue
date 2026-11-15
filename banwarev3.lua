@@ -20,7 +20,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-26"
+local BANWARE_BUILD = "v2-util-27"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -962,19 +962,21 @@ end
 -- translocate (63817), uekiller (64151). Each mode answers one question Ã¢â‚¬â€
 -- given the body's real CFrame, where does the server need to believe it is.
 local HIDE = {
-    ugPos = nil, ugAt = 0, ugParams = nil,
-    tlPos = nil, tlAt = 0, tlPart = nil, tlCap = 300,
+    ugPos = nil, ugAt = 0, ugHold = 0, ugParams = nil,
+    tlPos = nil, tlAt = 0, tlPart = nil, tlCap = 300, tlMin = 10000,
     ueY = 0, ueAt = 0,
     auRing = nil, auAt = 0,
     vjPos = nil, vjAt = 0,
+    seatY = nil, seatX = nil, seatZ = nil,
 }
 
 local function resetHide()
-    HIDE.ugPos, HIDE.ugAt = nil, 0
+    HIDE.ugPos, HIDE.ugAt, HIDE.ugHold = nil, 0, 0
     HIDE.tlPos, HIDE.tlAt, HIDE.tlCap = nil, 0, 300
     HIDE.ueY, HIDE.ueAt = 0, 0
     HIDE.auRing, HIDE.auAt = nil, 0
     HIDE.vjPos, HIDE.vjAt = nil, 0
+    HIDE.seatY, HIDE.seatX, HIDE.seatZ = nil, nil, nil
 end
 
 --==================================================
@@ -1061,7 +1063,17 @@ end
 -- times a second so the raycast costs nothing on the frames that skip it.
 local function hideUnderground(realCF)
     local now = os.clock()
-    if HIDE.ugPos and now < HIDE.ugAt then return HIDE.ugPos end
+    -- A permanent under-floor lie is what made the body fall. The write
+    -- replicates (env log: fflag=true), so the server keeps the fake; the
+    -- assembly then has no floor under it and the kill plane is NaN, so nothing
+    -- ever catches the drop. Instead the body sits under the floor for a short
+    -- pulse and is handed its real position back between pulses: one write of
+    -- the truth per cycle re-syncs the server instead of letting it pull the
+    -- assembly down for as long as the mode stays armed.
+    if HIDE.ugPos and now < HIDE.ugAt then
+        if now < HIDE.ugHold then return HIDE.ugPos end
+        return realCF
+    end
 
     if not HIDE.ugParams then
         HIDE.ugParams = RaycastParams.new()
@@ -1073,10 +1085,13 @@ local function hideUnderground(realCF)
 
     local pos = realCF.Position
     local hit = workspace:Raycast(pos + Vector3.new(0, 2, 0), Vector3.new(0, -512, 0), HIDE.ugParams)
-    HIDE.ugAt = now + 0.25
+    HIDE.ugAt = now + 0.8
+    HIDE.ugHold = now + 0.35
     if not hit then
+        -- no surface inside 512 studs: the body is already below the map, so
+        -- write the truth back rather than leaving the last fake standing
         HIDE.ugPos = nil
-        return nil
+        return realCF
     end
 
     local depth = math.clamp(CFG.UG_DEPTH, 5, 14)
@@ -1085,9 +1100,9 @@ local function hideUnderground(realCF)
     if floor ~= floor then floor = targetY end
     local y = math.max(targetY, floor)
 
-    if y > hit.Position.Y - 5 then
+    if y > hit.Position.Y - 5 or y < pos.Y - 64 then
         HIDE.ugPos = nil
-        return nil
+        return realCF
     end
 
     local out = realCF + Vector3.new(0, y - pos.Y, 0)
@@ -1354,6 +1369,18 @@ local function hideTranslocate(realCF, withSwing)
             -- it and the server has nothing legal to accept, which is why the
             -- 5000-stud setting never held.
             HIDE.tlCap = math.max(0, math.min(part.Size.X, part.Size.Z) / 2 - 2)
+
+            -- Kicia's no-target branch is a 10,000..1e9 shell; the brick is not.
+            -- It sits near the arena, so a brick anchor lands a few hundred
+            -- studs away - inside a desynced opponent's reach, which is exactly
+            -- the 343-stud Chainsaw kill logged in 20260215-220259/m02. Anything
+            -- nearer than the shell floor is not a hide, so the ring takes it.
+            local d = (HIDE.tlPos.Position - realCF.Position).Magnitude
+            if d < (HIDE.tlMin or 10000) then
+                HIDE.tlPos = RING.point()
+                HIDE.tlTag = string.format('brick %.0f away - ring', d)
+                HIDE.tlCap = 300
+            end
         else
             HIDE.tlPos = RING.point()
             HIDE.tlTag = gated and 'no target - ring' or 'no brick - ring'
@@ -1707,6 +1734,28 @@ local function voidStep(dt)
     local realCF = hrp.CFrame
     if not originalPos then originalPos = realCF.Position end
 
+    -- Fall watchdog. With the env on, FallenPartsDestroyHeight is NaN and
+    -- nothing below the map is ever destroyed, so a body that starts sinking
+    -- sinks for the rest of the session - the -1,006,976 Y on the status panel
+    -- is that. Seat is the highest point the real body has stood at; 150 studs
+    -- under it is not movement, it is the lie having been accepted and the
+    -- server dragging the assembly down. Put the body back and drop the cache.
+    local py = realCF.Position.Y
+    if not HIDE.seatY or py > HIDE.seatY then
+        HIDE.seatY, HIDE.seatX, HIDE.seatZ = py, realCF.Position.X, realCF.Position.Z
+    elseif py < HIDE.seatY - 150 then
+        pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(HIDE.seatX, HIDE.seatY, HIDE.seatZ)
+        end)
+        HIDE.ugPos, HIDE.ugHold, HIDE.ugAt = nil, 0, 0
+        HIDE.ueY = 0
+        HIDE.vjPos = nil
+        V.old = nil
+        bwDiag(string.format('void: fall caught at %.0f, reseated %.0f', py, HIDE.seatY))
+        return
+    end
+
     -- Translocate asks the question the other modes do not: is the server
     -- reachable? If it is, the lie goes down the game's own controller and the
     -- body never moves. If it is not, the old root write keeps the mode usable.
@@ -1762,10 +1811,10 @@ local function voidStep(dt)
 end
 
 local function voidRenderStep()
-    if not engineOn() then
-        V.old = nil
-        return
-    end
+    -- Runs even when the mode just went off: the fake was written on this
+    -- frame's Heartbeat and clearing the record without restoring leaves the
+    -- body on the lie with nothing to put it back, which is a free fall once
+    -- physics resumes.
     restoreReal()
 end
 
