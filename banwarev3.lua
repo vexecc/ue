@@ -20,7 +20,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-7"
+local BANWARE_BUILD = "v2-util-8"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -141,6 +141,28 @@ print('[Banware] Library: ' .. tostring(libraryOrigin))
 -- The script reads its option registry directly; keep the name local instead of
 -- relying on the library publishing it globally.
 local Options = Library.Options
+local Toggles = Library.Toggles or {}
+
+-- Toggles and every other control live in two registries in this fork:
+-- Library.Toggles for switches, Library.Options for sliders, dropdowns, inputs
+-- and keypickers. Reading a toggle out of Options returns nil, and every write
+-- through it is a silent no-op — so nothing in this script touches either
+-- table directly. Everything that sets or reads a control goes through here.
+local function optRef(key)
+    return Options[key] or Toggles[key]
+end
+
+local function setOpt(key, value)
+    local opt = optRef(key)
+    if not opt or not opt.SetValue then return false end
+    return (pcall(function() opt:SetValue(value) end))
+end
+
+local function optValue(key, fallback)
+    local opt = optRef(key)
+    if opt and opt.Value ~= nil then return opt.Value end
+    return fallback
+end
 
 local function loadAddon(name)
     local cachePath = 'Banware/addons/' .. name .. '.lua'
@@ -1143,7 +1165,7 @@ AUBox:AddSlider('VoidAUOffset', {
 
 auStatus = AUBox:AddLabel('off')
 
-AUBox:AddLabel('Stand takes their spot. Altitude keeps your X/Z.')
+AUBox:AddLabel('Stand takes their spot. Altitude keeps your X/Z.', true)
 
 --==================================================
 -- RIOT ABUSER (matches screenshot)
@@ -4334,7 +4356,7 @@ pcall(function() extendSlider:SetVisible(false) end)
 
 -- 0% is the floor the game itself allows: a cooldown of zero. The sliders run
 -- the full range down to it, so the fastest setting is the end of the track.
-UtilCool:AddLabel('0% = no cooldown. Ability slider also drives knife heavy, axe spin, throwables and deploys.')
+UtilCool:AddLabel('0% = no cooldown. Ability slider also drives knife heavy, axe spin, throwables and deploys.', true)
 
 addPercentOption(UtilCool, 'UtilFireCooldown', 'Fire Cooldown', 'FIRE_CD', 0, 100, 50)
 addPercentOption(UtilCool, 'UtilAimCooldown', 'Aim Cooldown', 'AIM_CD', 1, 100, 50)
@@ -4390,8 +4412,7 @@ UtilFuse:AddButton('Reset Weapon Handling', function()
         'UtilFireCooldown', 'UtilAimCooldown', 'UtilMeleeCooldown',
         'UtilDashCooldown', 'UtilGrenadeFuse', 'UtilRemoveFuse',
     }) do
-        local opt = Options[flag]
-        if opt and opt.SetValue then pcall(function() opt:SetValue(false) end) end
+        setOpt(flag, false)
     end
 
     restoreAllItems()
@@ -4605,9 +4626,7 @@ end)
 UtilQueue:AddButton('Queue Now', function()
     scanQueueTargets()
     scanModeTargets()
-    if Options.UtilQueueEnabled then
-        pcall(function() Options.UtilQueueEnabled:SetValue(true) end)
-    end
+    setOpt('UtilQueueEnabled', true)
     Q.ENABLED = true
     spamQueue('manual')
 end)
@@ -4744,7 +4763,7 @@ UtilBg:AddButton('Clear Background', function()
     toast('Background cleared', 2)
 end)
 
-bgStatusLabel = UtilBg:AddLabel('background: none')
+bgStatusLabel = UtilBg:AddLabel('background: none', true)
 
 local function readHexFlag(flag, fallback)
     local opt = Options[flag]
@@ -4900,10 +4919,8 @@ UtilVisuals:AddButton('Reset Visuals', function()
     VIS.fovOn = false
     VIS.offsetOn = false
     VIS.x, VIS.y, VIS.z = 0, 0, 0
-    pcall(function()
-        if Options.UtilFov then Options.UtilFov:SetValue(false) end
-        if Options.UtilVmOffsets then Options.UtilVmOffsets:SetValue(false) end
-    end)
+    setOpt('UtilFov', false)
+    setOpt('UtilVmOffsets', false)
     toast('visuals reset', 1.5)
 end)
 
@@ -5039,9 +5056,9 @@ end
 -- Petals and the watermark are toggles, not one-shot buttons, so they rebuild
 -- from the saved flag the same way.
 do
-    local petals = Options.UtilPetals and Options.UtilPetals.Value
+    local petals = optValue('UtilPetals', false)
     if petals then pcall(setPetals, true) end
-    local mark = Options.UtilWatermark and Options.UtilWatermark.Value
+    local mark = optValue('UtilWatermark', false)
     if mark then
         pcall(function()
             if Library.SetWatermark then Library:SetWatermark('banware v2') end
@@ -5533,21 +5550,19 @@ end)
 -- Wrapped in one function purely to keep the main chunk under Luau's 200-local
 -- ceiling; it runs immediately below.
 local __bwPresets = function()
-    local SEL = function(key, value)
-        local opt = Options[key]
-        if not opt or not opt.SetValue then return false end
-        return (pcall(function() opt:SetValue(value) end))
-    end
-
-    -- Everything "max speed" lives here once. The per-preset tables only carry
-    -- the differences.
+    -- Everything "max speed" lives here once. Both weapon classes are switched
+    -- on at the same time on purpose: a knife and a shotgun read different
+    -- fields, so a full set costs nothing and the config keeps working when you
+    -- swap mid-match instead of needing a reload.
     local MAXED = {
-        -- firing
+        -- projectile
         UtilRecoil = true, UtilRecoilPct = 100,
         UtilNoSpread = true,
         UtilNoParticles = true,
         UtilAimSpeed = true, UtilAimSpeedPct = 500,
+        UtilAutoWeapon = true,
         -- melee
+        UtilAlwaysBackstab = true,
         UtilExtendMelee = true, UtilMeleeRange = 60,
         -- cooldowns: 0% is the game's own floor
         UtilFireCooldown = true, UtilFireCooldownPct = 0,
@@ -5568,11 +5583,40 @@ local __bwPresets = function()
         SetXDist = 1000000, SetYDist = 0, SetZDist = 1000000,
     }
 
+    -- Same block split by weapon class, for the one-click swap. Only the fields
+    -- that weapon actually reads are written; the other class is left alone so
+    -- flipping to Melee does not quietly disarm your gun settings.
+    local PROFILES = {
+        Both = MAXED,
+        Melee = {
+            UtilAlwaysBackstab = true,
+            UtilExtendMelee = true, UtilMeleeRange = 60,
+            UtilMeleeCooldown = true, UtilMeleeCooldownPct = 0,
+            UtilDashCooldown = true, UtilDashCooldownPct = 0,
+        },
+        Projectile = {
+            UtilRecoil = true, UtilRecoilPct = 100,
+            UtilNoSpread = true, UtilNoParticles = true,
+            UtilAimSpeed = true, UtilAimSpeedPct = 500,
+            UtilAutoWeapon = true,
+            UtilFireCooldown = true, UtilFireCooldownPct = 0,
+            UtilAimCooldown = true, UtilAimCooldownPct = 1,
+        },
+    }
+
     local function merge(base, extra)
         local out = {}
         for k, v in pairs(base) do out[k] = v end
         for k, v in pairs(extra) do out[k] = v end
         return out
+    end
+
+    local function applyTable(t)
+        local n = 0
+        for k, v in pairs(t) do
+            if setOpt(k, v) then n = n + 1 end
+        end
+        return n
     end
 
     local PRESETS = {
@@ -5581,11 +5625,8 @@ local __bwPresets = function()
             label = '1 - Anti-Rage',
             theme = 'Nihon Crimson',
             sound = 'Rocket',
-            blurb = 'melee: knife backstab, 60 st reach, 0 cooldown',
+            blurb = 'knife or shotgun, underground, lift armed',
             v = merge(MAXED, {
-                WeaponType = 'Melee',
-                UtilAlwaysBackstab = true,
-                UtilAutoWeapon = false,
                 RandomizerMethod = 'Chaos',
                 MovementPattern = 'Desync',
                 VoidHideMode = 'Underground',
@@ -5602,11 +5643,8 @@ local __bwPresets = function()
             label = '2 - Anti-Legit',
             theme = 'Ice Blue',
             sound = 'Glitch',
-            blurb = 'projectile: shotgun / wildcat, no spread, auto fire',
+            blurb = 'shotgun main, knife backup, translocate swing',
             v = merge(MAXED, {
-                WeaponType = 'Projectile',
-                UtilAutoWeapon = true,
-                UtilAlwaysBackstab = true,
                 MovementPattern = 'Orbit',
                 VoidHideMode = 'Translocate',
                 VoidTLOffset = -5,
@@ -5624,11 +5662,8 @@ local __bwPresets = function()
             label = '3 - UE Counter',
             theme = 'Lavender Field',
             sound = 'Pulse',
-            blurb = 'stand exactly on the climber, no gate, no offset',
+            blurb = 'stand on the climber, no gate, no offset',
             v = merge(MAXED, {
-                WeaponType = 'Projectile',
-                UtilAutoWeapon = true,
-                UtilAlwaysBackstab = true,
                 MovementPattern = 'None',
                 VoidHideMode = 'Underground',
                 VoidUGDepth = 14,
@@ -5641,11 +5676,8 @@ local __bwPresets = function()
             label = '4 - Everything',
             theme = 'Sakura Bloom',
             sound = 'Bass',
-            blurb = 'lift first, random shell behind it, both weapons maxed',
+            blurb = 'lift first, random shell behind it, both weapons',
             v = merge(MAXED, {
-                WeaponType = 'Projectile',
-                UtilAutoWeapon = true,
-                UtilAlwaysBackstab = true,
                 RandomizerMethod = 'Quantum',
                 MovementPattern = 'Erratic',
                 VoidHideMode = 'Random',
@@ -5661,14 +5693,11 @@ local __bwPresets = function()
     }
 
     local function applyPreset(p)
-        local n = 0
-        for k, v in pairs(p.v) do
-            if SEL(k, v) then n = n + 1 end
-        end
-        if p.theme and SEL('UtilTheme', p.theme) then n = n + 1 end
-        if p.sound and SEL('SelectSound', p.sound) then n = n + 1 end
+        local n = applyTable(p.v)
+        if p.theme and setOpt('UtilTheme', p.theme) then n = n + 1 end
+        if p.sound and setOpt('SelectSound', p.sound) then n = n + 1 end
         for k, v in pairs(p.post) do
-            if SEL(k, v) then n = n + 1 end
+            if setOpt(k, v) then n = n + 1 end
         end
         Library:Notify(string.format('%s applied - %d options', p.label, n), 3)
         return n
@@ -5682,7 +5711,7 @@ local __bwPresets = function()
 
     local Box = Tabs.Settings:AddRightGroupbox('Presets')
 
-    Box:AddLabel('Each button applies the config and writes it to disk as configs/settings/<id>.json')
+    Box:AddLabel('Applies the config, then saves it as configs/settings/<id>.json', true)
 
     for _, p in ipairs(PRESETS) do
         Box:AddButton({
@@ -5692,8 +5721,23 @@ local __bwPresets = function()
                 savePreset(p)
             end,
         })
-        Box:AddLabel(p.blurb)
+        Box:AddLabel(p.blurb, true)
     end
+
+    -- Weapon swap without touching the rest of the config. Both is the default
+    -- because it survives picking anything up.
+    local armed = false
+    Box:AddDropdown('PresetWeaponProfile', {
+        Values = { 'Both', 'Melee', 'Projectile' },
+        Default = 1,
+        Text = 'Weapon Profile',
+        Callback = function(v)
+            if not armed then return end
+            local n = applyTable(PROFILES[v] or PROFILES.Both)
+            Library:Notify(string.format('%s profile - %d options', tostring(v), n), 2)
+        end,
+    })
+    armed = true
 
     Box:AddButton({
         Text = 'Write All 4 To Disk',
@@ -5712,7 +5756,7 @@ local __bwPresets = function()
         end,
     })
 
-    Box:AddLabel('Applies in order, so the last one is what you end up holding')
+    Box:AddLabel('Runs in order - the last one stays applied', true)
 end
 
 __bwPresets()
