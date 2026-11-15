@@ -20,7 +20,7 @@ end)
 
 -- Build stamp. Bump this whenever the file changes so a stale execute is
 -- visible in the console instead of being diagnosed from a line number.
-local BANWARE_BUILD = "v2-util-20"
+local BANWARE_BUILD = "v2-util-26"
 getgenv().BANWARE_BUILD = BANWARE_BUILD
 
 print("[Banware] Build: " .. BANWARE_BUILD)
@@ -506,7 +506,7 @@ local Toggles = Library.Toggles or {}
 -- Toggles and every other control live in two registries in this fork:
 -- Library.Toggles for switches, Library.Options for sliders, dropdowns, inputs
 -- and keypickers. Reading a toggle out of Options returns nil, and every write
--- through it is a silent no-op â€” so nothing in this script touches either
+-- through it is a silent no-op Ã¢â‚¬â€ so nothing in this script touches either
 -- table directly. Everything that sets or reads a control goes through here.
 local function optRef(key)
     return Options[key] or Toggles[key]
@@ -777,9 +777,9 @@ local CFG = {
     HIDE_MODE = 'Void Jump',
     UG_DEPTH = 10,
     TL_OFFSET = -5,
-    TL_SWING = 2000,
+    TL_SWING = 0,
     TL_SPEED = 3,
-    RAND_RADIUS = 10000,
+    RAND_RADIUS = 200,
     UE_CLIMB = 10000,
     UE_COOLDOWN = 0.2,
     -- translocate transport: the server path is the one kicia and k1 use, the
@@ -791,7 +791,7 @@ local CFG = {
 
     -- Anti-UE counter
     ANTIUE = false,
-    AU_MODE = 'Stand',
+    AU_MODE = 'Below',
     AU_MIN = 100,
     AU_OFFSET = 3,
 }
@@ -959,27 +959,100 @@ end
 -- VOID HIDE POSITIONS
 --==================================================
 -- Ported from kicia's evasion controller: underground (cuckkica.lua:64098),
--- translocate (63817), uekiller (64151). Each mode answers one question â€”
+-- translocate (63817), uekiller (64151). Each mode answers one question Ã¢â‚¬â€
 -- given the body's real CFrame, where does the server need to believe it is.
 local HIDE = {
     ugPos = nil, ugAt = 0, ugParams = nil,
-    tlPos = nil, tlAt = 0, tlPart = nil,
+    tlPos = nil, tlAt = 0, tlPart = nil, tlCap = 300,
     ueY = 0, ueAt = 0,
+    auRing = nil, auAt = 0,
+    vjPos = nil, vjAt = 0,
 }
 
 local function resetHide()
     HIDE.ugPos, HIDE.ugAt = nil, 0
-    HIDE.tlPos, HIDE.tlAt = nil, 0
+    HIDE.tlPos, HIDE.tlAt, HIDE.tlCap = nil, 0, 300
     HIDE.ueY, HIDE.ueAt = 0, 0
+    HIDE.auRing, HIDE.auAt = nil, 0
+    HIDE.vjPos, HIDE.vjAt = nil, 0
 end
 
--- Uniform point on a sphere shell around an origin.
-local function randomAround(origin, minR, maxR)
-    local r = minR + math.random() * math.max(maxR - minR, 0)
+--==================================================
+-- THE SPATIAL RING
+--==================================================
+-- Rivals does not accept an arbitrary server position. Its movement validation
+-- keeps the body inside one of two hashed rings, and the client dump's own
+-- evasion parks the body in the outer one whenever it needs a place no weapon
+-- can reach (cuckkica.lua jL / getImmune, used by every defensive path there).
+--
+-- The geometry, exactly as the dump builds it (cuckkica.lua jL fn38/fn41/fn42):
+--
+--   ring   Min          Max            cells      YMin        YSpan
+--   inner     65,536       524,288         224      66,000      457,825
+--   outer 134,217,728 1,073,741,824  458,752  134,218,192  939,523,169
+--
+--   YMin  = Min + 400 + 64
+--   YSpan = Max - 400 - 64 - YMin + 1
+--
+-- A cell centres on Min + 1024 + k*2048 and a point is only legal within 400
+-- studs of that centre - the dump's own validator rejects anything else. That
+-- is why a uniformly random coordinate in the band is not enough: it lands in
+-- the dead space between cells and gets snapped back. The point has to be
+-- built from a cell index, then jittered inside a 200-stud sphere, which is
+-- what fn42 does.
+--
+-- A point in the outer ring is ~1e8 studs from any fight on the map. Every
+-- hitscan range in the game fails at that distance and the server still treats
+-- the position as legal, because it sits inside a cell.
+local RING = {
+    inner = { Min = 65536, Max = 524288 },
+    outer = { Min = 134217728, Max = 1073741824 },
+}
+
+function RING.point(which, jitter)
+    local r = RING[which or 'outer'] or RING.outer
+    local cells = (r.Max - r.Min) / 2048
+    local yMin = r.Min + 464
+    local ySpan = r.Max - 464 - yMin + 1
+
+    local cx = math.random(0, cells - 1)
+    local cz = math.random(0, cells - 1)
+
+    -- uniform inside a sphere: radius scaled by u^(1/3), direction on the unit
+    -- sphere. 400 is the validator's hard limit from the cell centre.
+    local rad = math.clamp(tonumber(jitter) or 200, 0, 400)
+    if rad > 0 then rad = rad * math.random() ^ (1 / 3) end
     local u = math.random() * 2 - 1
     local a = math.random() * math.pi * 2
     local s = math.sqrt(math.max(1 - u * u, 0))
-    return CFrame.new(origin + Vector3.new(s * math.cos(a), u, s * math.sin(a)) * r)
+
+    local x = r.Min + 1024 + cx * 2048 + rad * s * math.cos(a)
+    local z = r.Min + 1024 + cz * 2048 + rad * s * math.sin(a)
+    local y = yMin + math.random() * ySpan + rad * u
+
+    return CFrame.new(x, y, z) * CFrame.fromOrientation(
+        math.random() * math.pi * 2,
+        math.random() * math.pi * 2,
+        math.random() * math.pi * 2)
+end
+
+-- True when a coordinate is inside one of the two rings, near enough to a cell
+-- centre to pass the dump's own validator. Same test as fn43.
+function RING.valid(p)
+    for _, name in ipairs({ 'outer', 'inner' }) do
+        local r = RING[name]
+        local x, y, z = p.X, p.Y, p.Z
+        local min, max = r.Min, r.Max
+        if x > min and x < max and z > min and z < max and y > min and y < max then
+            local cx = math.floor((x - min) / 2048)
+            local cz = math.floor((z - min) / 2048)
+            local px = min + 1024 + cx * 2048
+            local pz = min + 1024 + cz * 2048
+            local dx, dz = x - px, z - pz
+            if math.sqrt(dx * dx + dz * dz) < 400 then return name end
+        end
+    end
+    return nil
 end
 
 -- kicia Underground: one 512-stud drop from two studs above the root, sit
@@ -1024,11 +1097,16 @@ end
 
 -- kicia / k1 Translocate, verbatim behaviour:
 --   compute(clientCFrame, hasTargets)
---     if not hasTargets -> uniform random point on a 10000..1e9 shell
+--     if not hasTargets -> a random point on a sphere shell between 10,000 and
+--                          1e9 studs from the current body
 --     else              -> the OutOfBoundsPart tagged KillDelay == 0, offset by
 --                          half its height plus the configured nudge (-5..5)
 -- The offset slider in both menus is -5..5 with -5 as the default, which is
 -- why the anchor sits just under the brick instead of inside it.
+--
+-- Banware keeps both branches but replaces the 10k..1e9 shell with a ring cell:
+-- a uniform shell point is rarely inside a cell, and the server snaps a
+-- coordinate that is not in one. The ring is the only far place that holds.
 --
 -- What makes it work is the transport, not the point: both menus push the
 -- result through characterController:SetServerCFrame(), so the client body
@@ -1120,6 +1198,7 @@ local TL = (function()
 
     local function resolve()
         if CC.inst then return CC.inst end
+        if CC.dead then return nil end
         local now = os.clock()
         if now < CC.at then return nil end
         -- a session that never resolves must not pay a full GC walk every three
@@ -1176,7 +1255,15 @@ local TL = (function()
                 found, bestDist, CC.tries))
             return best
         end
-        CC.err = string.format('no controller (%d candidates, try %d)', found, CC.tries)
+        CC.err = string.format('root write (%d candidates, try %d)', found, CC.tries)
+        if CC.tries >= 3 then
+            -- The controller every kicia-shaped menu writes through is that
+            -- menu's own rootDesync object, not something the game publishes;
+            -- on a session with no such menu loaded there is nothing to find and
+            -- there never will be. Three full GC walks is the whole budget -
+            -- after that the root write is the transport and the scans stop.
+            CC.dead = true
+        end
         return nil
     end
 
@@ -1262,9 +1349,15 @@ local function hideTranslocate(realCF, withSwing)
             local offset = math.clamp(CFG.TL_OFFSET, -5, 5)
             HIDE.tlPos = part.CFrame * CFrame.new(0, -part.Size.Y / 2 + offset, 0)
             HIDE.tlTag = 'brick'
+            -- the anchor only holds while the body stays under the brick. A
+            -- lateral swing bigger than half its footprint walks out from under
+            -- it and the server has nothing legal to accept, which is why the
+            -- 5000-stud setting never held.
+            HIDE.tlCap = math.max(0, math.min(part.Size.X, part.Size.Z) / 2 - 2)
         else
-            HIDE.tlPos = randomAround(realCF.Position, 10000, 1e9)
-            HIDE.tlTag = gated and 'no target - shell' or 'no brick - shell'
+            HIDE.tlPos = RING.point()
+            HIDE.tlTag = gated and 'no target - ring' or 'no brick - ring'
+            HIDE.tlCap = 300
         end
     end
 
@@ -1272,7 +1365,8 @@ local function hideTranslocate(realCF, withSwing)
     if not base then return nil end
 
     if withSwing then
-        local swing = math.clamp(CFG.TL_SWING or 0, 0, 1e9)
+        local cap = HIDE.tlCap or 300
+        local swing = math.clamp(CFG.TL_SWING or 0, 0, cap)
         if swing > 0 then
             local speed = math.max(CFG.TL_SPEED or 1, 0.05)
             local x = math.cos(elapsed * math.pi * 2 * speed) * swing
@@ -1283,34 +1377,40 @@ local function hideTranslocate(realCF, withSwing)
 end
 
 
--- kicia Random: shell around the body, base radius scaled by a random factor.
+-- Random: a point inside the outer ring. `Random Spread` is the jitter radius
+-- inside the cell, capped at the validator's 400-stud limit - anything wider
+-- walks off the cell and gets snapped back, which is what the old 1e9 shell was
+-- doing every frame.
 local function hideRandom(realCF)
-    local base = math.max(CFG.RAND_RADIUS, 5)
-    return randomAround(realCF.Position, base, math.min(base * 100, 1e9))
+    return RING.point(nil, math.clamp(CFG.RAND_RADIUS or 200, 0, 400))
 end
 
--- kicia UEKiller: climb by a fixed distance on a cooldown. Every raycast
--- envelope in the lobby is left behind within a couple of ticks.
+-- UEKiller, verbatim from the dump (cuckkica.lua j3): the offset starts at
+-- YDistance on the first tick, grows by it every cooldown, and clamps at 1e7 -
+-- it never resets, because a reset would put the body back inside every
+-- raycast envelope it just climbed out of.
 local function hideUE(realCF)
     local now = os.clock()
-    if now >= HIDE.ueAt then
-        HIDE.ueAt = now + math.max(CFG.UE_COOLDOWN, 0)
-        HIDE.ueY = HIDE.ueY + math.clamp(CFG.UE_CLIMB, 100, 1e12)
-        if HIDE.ueY > 1e14 then HIDE.ueY = 0 end
+    if HIDE.ueAt == 0 then
+        HIDE.ueAt = now + math.max(CFG.UE_COOLDOWN or 0.2, 0)
+        HIDE.ueY = math.clamp(CFG.UE_CLIMB or 100, 1, 1e7)
+    elseif now >= HIDE.ueAt then
+        HIDE.ueAt = now + math.max(CFG.UE_COOLDOWN or 0.2, 0)
+        HIDE.ueY = math.min(HIDE.ueY + math.clamp(CFG.UE_CLIMB or 100, 1, 1e7), 1e7)
     end
     return realCF + Vector3.new(0, HIDE.ueY, 0)
 end
 
 --==================================================
--- ROOT WRITE â€” fake on Heartbeat, truth back before render
+-- ROOT WRITE Ã¢â‚¬â€ fake on Heartbeat, truth back before render
 --==================================================
 -- kicia's root desync (kiciapermcleaned.lua:124086): read the live CFrame,
 -- remember it, write the lie. The render step puts the truth back at
--- RenderPriority.First â€” before the camera is drawn and before the physics
--- step â€” so the body keeps moving normally while the server is told something
+-- RenderPriority.First Ã¢â‚¬â€ before the camera is drawn and before the physics
+-- step Ã¢â‚¬â€ so the body keeps moving normally while the server is told something
 -- else. Velocities are saved across the fake write so the lie never flings the
 -- real body when it comes back.
-local V = { old = nil, fake = nil, lv = nil, av = nil }
+local V = { old = nil, fake = nil, raw = nil }
 
 local function withIdentity(id, fn)
     if type(setthreadidentity) ~= 'function' then return pcall(fn) end
@@ -1328,25 +1428,103 @@ local function detachRep(root)
     pcall(sethiddenproperty, root, 'PhysicsRepRootPart', nil)
 end
 
-local function writeFake(root, cf)
-    V.lv = root.AssemblyLinearVelocity
-    V.av = root.AssemblyAngularVelocity
+-- The environment a root-write desync actually needs.
+--
+-- Two engine behaviours undo a fake CFrame before it ever leaves the machine:
+--
+--   * Roblox deletes any assembly that drops below FallenPartsDestroyHeight,
+--     so a fake under the floor kills the character instead of hiding it. The
+--     NaN write disables that check entirely - NaN never compares below a
+--     number.
+--   * A network-owned assembly is only described to the server at the
+--     physics sender rate, and the assembly history buffer drops the change
+--     once it has moved far enough in one step. Both defaults are far too
+--     small for a jump to 2^30, so the write is coalesced away and the server
+--     keeps the old position.
+--
+-- The game's own evasion toggles exactly these four values when it engages
+-- (ragebot SetEnabled in the client dump), which is why its fakes replicate
+-- and a plain root write does not.
+V.env = { on = false, fallen = nil }
+
+local function writeFallen(v)
+    -- The property is locked: a plain assignment is swallowed. The dump reaches
+    -- it through the game DataModel's own __newindex (cuckkica.lua: v112 =
+    -- clonefn(getrawmetatable(game).__newindex)), which is the only path that
+    -- takes a NaN, so that is tried first.
+    if not V.raw and type(getrawmetatable) == 'function' then
+        local ok, mt = pcall(getrawmetatable, game)
+        if ok and type(mt) == 'table' and type(mt.__newindex) == 'function' then
+            V.raw = mt.__newindex
+        end
+    end
+    local function took()
+        local cur = workspace.FallenPartsDestroyHeight
+        if v ~= v then return cur ~= cur end
+        return cur == v
+    end
     withIdentity(8, function()
-        detachRep(root)
-        root.CFrame = cf
+        if V.raw then pcall(V.raw, workspace, 'FallenPartsDestroyHeight', v) end
     end)
-    root.AssemblyLinearVelocity = Vector3.zero
-    root.AssemblyAngularVelocity = Vector3.zero
+    if took() then return true end
+    pcall(function() workspace.FallenPartsDestroyHeight = v end)
+    if took() then return true end
+    if type(sethiddenproperty) == 'function' then
+        pcall(sethiddenproperty, workspace, 'FallenPartsDestroyHeight', v)
+    end
+    return took()
+end
+
+function V.envOn()
+    if V.env.on then return end
+    V.env.on = true
+    V.env.fallen = workspace.FallenPartsDestroyHeight
+    local ok = writeFallen(0 / 0)
+    local sent = false
+    if type(setfflag) == 'function' then
+        sent = true
+        pcall(setfflag, 'DFIntS2PhysicsSenderRate', '120')
+        pcall(setfflag, 'DFIntAssemblyHistoryBufferSize', '2147483648')
+        pcall(setfflag, 'DFIntAssemblyHistorySkipSize', '0')
+    end
+    bwDiag(string.format('env: on fallen=%s fflag=%s ok=%s',
+        tostring(workspace.FallenPartsDestroyHeight), tostring(sent), tostring(ok)))
+end
+
+function V.envOff()
+    if not V.env.on then return end
+    V.env.on = false
+    local f = V.env.fallen
+    V.env.fallen = nil
+    if type(f) == 'number' and f == f then writeFallen(f) end
+    if type(setfflag) == 'function' then
+        pcall(setfflag, 'DFIntS2PhysicsSenderRate', '15')
+        pcall(setfflag, 'DFIntAssemblyHistoryBufferSize', '15')
+        pcall(setfflag, 'DFIntAssemblyHistorySkipSize', '8')
+    end
+    bwDiag('env: off')
+end
+
+-- Write the lie, keep nothing else. The dump's rootDesync (cuckkica.lua cs) is
+-- exactly two statements - save the truth once, write the fake - and it does not
+-- touch velocity, angular velocity or the replication root. Zeroing velocity
+-- here used to freeze the real body for the whole frame and, worse, made every
+-- write look like a 2^30-stud teleport at zero speed, which is the shape the
+-- assembly history buffer exists to discard.
+local function writeFake(root, cf)
+    root.CFrame = cf
 end
 
 local function restoreReal()
     local root = getRoot()
     local cf = V.old
-    if not root or not cf then return end
+    if not root or not cf then
+        V.fake = nil
+        return
+    end
     root.CFrame = cf
-    if V.lv then root.AssemblyLinearVelocity = V.lv end
-    if V.av then root.AssemblyAngularVelocity = V.av end
     V.old = nil
+    V.fake = nil
 end
 
 --==================================================
@@ -1362,7 +1540,33 @@ end
 -- Declared above hidePosition on purpose: a Luau local only exists from the
 -- line that declares it downward, so hidePosition calling a function defined
 -- further down the file resolves to a global that is never assigned.
-local AU = { tag = 'idle', target = nil }
+--
+-- Below (the default) is the only mode that ends the race. Matching their
+-- altitude invites a taller match, and every reply is a bigger number, so the
+-- climb never converges. Below does not answer altitude with altitude: it
+-- raycasts down from over their head, finds the surface they are standing over,
+-- and parks our server position underneath it. Their hitscan leaves their own
+-- origin and meets the floor first. Nothing on our side moves, so there is
+-- nothing left to out-climb.
+--
+-- Below needs the FallenPartsDestroyHeight write that V.envOn does, or the
+-- assembly is deleted for being under the world instead of hidden by it.
+local AU = { tag = 'idle', target = nil, pos = nil, at = 0, src = nil, params = nil, depth = 10 }
+
+function AU.ground(p)
+    if not AU.params then
+        AU.params = RaycastParams.new()
+        AU.params.FilterType = Enum.RaycastFilterType.Exclude
+        AU.params.IgnoreWater = true
+        AU.params.RespectCanCollide = true
+    end
+    AU.params.FilterDescendantsInstances = { LocalPlayer.Character, workspace.CurrentCamera }
+    local ok, hit = pcall(function()
+        return workspace:Raycast(p + Vector3.new(0, 2, 0), Vector3.new(0, -512, 0), AU.params)
+    end)
+    if not ok or not hit then return nil end
+    return hit.Position.Y
+end
 
 local function hideAntiUE(realCF)
     local best, bestY = nil, -math.huge
@@ -1383,28 +1587,73 @@ local function hideAntiUE(realCF)
 
     if not best then
         AU.tag = 'no target'
-        AU.target = nil
+        AU.target, AU.pos, AU.src = nil, nil, nil
         return nil
     end
 
     local myPos = realCF.Position
-    -- a ground fight stays a ground fight: only lift for someone genuinely
-    -- above us
-    if bestY < myPos.Y + math.clamp(CFG.AU_MIN, 0, 1e7) then
+    local gate = math.clamp(CFG.AU_MIN, 0, 1e7)
+    -- a ground fight stays a ground fight: only act on someone genuinely above
+    if bestY < myPos.Y + gate then
         AU.tag = string.format('highest %.0f, below gate', bestY - myPos.Y)
-        AU.target = nil
+        AU.target, AU.pos, AU.src = nil, nil, nil
         return nil
     end
 
     local off = math.clamp(CFG.AU_OFFSET, -1e6, 1e6)
     local p = best.Position
     AU.target = best
-    AU.tag = string.format('%s @ %.0f', tostring(best.Parent and best.Parent.Name or '?'), p.Y)
+    local who = tostring(best.Parent and best.Parent.Name or '?')
+    local now = os.clock()
 
     if CFG.AU_MODE == 'Altitude' then
+        AU.tag = string.format('alt %s @ %.0f', who, p.Y)
+        AU.pos = nil
         return CFrame.new(myPos.X, p.Y + off, myPos.Z)
+    elseif CFG.AU_MODE == 'Mirror' then
+        AU.tag = string.format('mirror %s @ %.0f', who, p.Y)
+        AU.pos = nil
+        return CFrame.new(p.X, p.Y + off, p.Z)
+    elseif CFG.AU_MODE == 'Ring' then
+        AU.pos, AU.src = nil, nil
+        if not HIDE.auRing or now >= HIDE.auAt then
+            HIDE.auAt = now + 1.5
+            HIDE.auRing = RING.point()
+        end
+        AU.tag = string.format('ring vs %s @ %.0f', who, p.Y)
+        return HIDE.auRing
     end
-    return CFrame.new(p.X, p.Y + off, p.Z)
+
+    -- Below. Re-scan at 4 Hz, or immediately when they have moved out from
+    -- under the cached point, so the body follows them instead of sitting in a
+    -- hole they left.
+    if AU.pos and now < AU.at and AU.src and (p - AU.src).Magnitude < 48 then
+        return AU.pos
+    end
+    AU.at = now + 0.25
+    AU.src = p
+
+    local surface = AU.ground(p)
+    if not surface then
+        -- no surface under them: they are past the map edge, where a fixed drop
+        -- has no floor to reference. Use the ring instead - accepted, and out of
+        -- every range at once.
+        AU.tag = string.format('no floor under %s - ring', who)
+        local out = RING.point()
+        AU.pos = out
+        return out
+    end
+
+    local y = surface - AU.depth
+    local floor = workspace.FallenPartsDestroyHeight + 10
+    if floor ~= floor then floor = y end
+    if y > surface - 3 then y = surface - 3 end
+    if y < floor and floor < surface then y = floor end
+
+    local out = CFrame.new(p.X, y, p.Z)
+    AU.pos = out
+    AU.tag = string.format('below %s %.0f', who, p.Y - y)
+    return out
 end
 
 local function hidePosition(realCF, withSwing)
@@ -1425,7 +1674,22 @@ local function hidePosition(realCF, withSwing)
     elseif mode == 'UEKiller' then
         return hideUE(realCF)
     end
-    return CFrame.new(applyMotion(stepOffset(realCF.Position)))
+
+    -- Legacy Void Jump (the offset-table mode). A configured offset can land
+    -- outside both rings - 1e6 and 1e7 both do - and the server refuses a
+    -- coordinate that does not sit in a cell. Rather than write a lie that
+    -- cannot hold, substitute a legal ring cell and let the mode keep working.
+    local target = applyMotion(stepOffset(realCF.Position))
+    if RING.valid(target) then
+        HIDE.vjPos, HIDE.vjAt = nil, 0
+        return CFrame.new(target)
+    end
+    local now = os.clock()
+    if not HIDE.vjPos or now >= HIDE.vjAt then
+        HIDE.vjAt = now + 0.25
+        HIDE.vjPos = RING.point().Position
+    end
+    return CFrame.new(HIDE.vjPos)
 end
 
 local function engineOn()
@@ -1451,6 +1715,12 @@ local function voidStep(dt)
         and TL.probe() ~= nil
 
     local fake = hidePosition(realCF, not serverPath)
+    if V.lastMode ~= CFG.HIDE_MODE then
+        V.lastMode = CFG.HIDE_MODE
+        bwDiag(string.format('void: %s -> %s %s', tostring(CFG.HIDE_MODE),
+            fake and 'lie' or 'nil',
+            fake and string.format('%.0f %.0f %.0f', fake.X, fake.Y, fake.Z) or ''))
+    end
     if not fake then return end
     local p = fake.Position
     if p.X ~= p.X or p.Y ~= p.Y or p.Z ~= p.Z then return end
@@ -1480,11 +1750,11 @@ local function voidStep(dt)
         if tlUi.status and CFG.HIDE_MODE == 'Translocate' then
             pcall(function()
                 if TL.state.inst then
-                    tlUi.status:SetText(string.format('controller: live | %s | %s',
-                        CFG.TL_SERVER and 'server cframe' or 'root write',
+                    tlUi.status:SetText(string.format('transport: game controller | %s',
                         tostring(HIDE.tlTag or '-')))
                 else
-                    tlUi.status:SetText('controller: ' .. tostring(TL.state.err))
+                    tlUi.status:SetText(string.format('transport: root write | %s',
+                        tostring(HIDE.tlTag or '-')))
                 end
             end)
         end
@@ -1505,13 +1775,18 @@ function startVoid()
     if hrp then originalPos = hrp.Position end
     elapsed = 0
     resetHide()
-    V.old, V.lv, V.av = nil, nil, nil
+    V.old = nil
+    V.envOn()
     pcall(function() RunService:UnbindFromRenderStep('BanwareVoidRestore') end)
     pcall(function()
         RunService:BindToRenderStep('BanwareVoidRestore', Enum.RenderPriority.First.Value, voidRenderStep)
     end)
     conns.void = RunService.Heartbeat:Connect(function(dt)
-        if not engineOn() then killConn("void"); return end
+        if not engineOn() then
+            killConn("void")
+            V.envOff()
+            return
+        end
         voidStep(dt)
     end)
 end
@@ -1521,7 +1796,8 @@ function stopVoid()
     pcall(function() RunService:UnbindFromRenderStep('BanwareVoidRestore') end)
     restoreReal()
     TL.release()
-    V.old, V.fake, V.lv, V.av = nil, nil, nil, nil
+    V.old, V.fake = nil, nil
+    V.envOff()
     resetHide()
     originalPos = nil
 end
@@ -1565,7 +1841,7 @@ VoidLeft:AddSlider('VoidDistance', {
 
 VoidLeft:AddSlider('SetXDist', {
     Text = 'Set X Dist',
-    Default = 10000000,
+    Default = 200000000,
     Min = -1000000000,
     Max = 1000000000,
     Unit = ' studs',
@@ -1585,7 +1861,7 @@ VoidLeft:AddSlider('SetYDist', {
 
 VoidLeft:AddSlider('SetZDist', {
     Text = 'Set Z Dist',
-    Default = 10000000,
+    Default = 200000000,
     Min = -1000000000,
     Max = 1000000000,
     Unit = ' studs',
@@ -1707,11 +1983,12 @@ vis.tlOffset = PosBox:AddSlider('VoidTLOffset', {
 
 vis.tlSwing = PosBox:AddSlider('VoidTLSwing', {
     Text = 'Translocate Swing',
-    Default = 2000,
+    Default = 0,
     Min = 0,
-    Max = 1000000000,
+    Max = 1000,
     Rounding = 0,
     Unit = ' studs',
+    Tooltip = 'Lateral drift under the anchor, clamped to half the brick footprint so the body never leaves it.',
     Callback = function(v) CFG.TL_SWING = v; resetHide() end,
 })
 
@@ -1756,12 +2033,13 @@ tlUi.range = PosBox:AddSlider('VoidTLRange', {
 tlUi.status = PosBox:AddLabel('controller: not probed')
 
 vis.randRadius = PosBox:AddSlider('VoidRandRadius', {
-    Text = 'Random Base Radius',
-    Default = 10000,
-    Min = 5,
-    Max = 1000000000,
+    Text = 'Random Spread',
+    Default = 200,
+    Min = 0,
+    Max = 400,
     Rounding = 0,
     Unit = ' studs',
+    Tooltip = 'Jitter radius inside the ring cell. 400 is the validator limit; wider walks off the cell.',
     Callback = function(v) CFG.RAND_RADIUS = v; resetHide() end,
 })
 
@@ -1796,7 +2074,9 @@ AUBox:AddToggle('VoidAntiUE', {
     Default = false,
     Callback = function(v)
         CFG.ANTIUE = v
+        AU.pos, AU.src = nil, nil
         if v then
+            V.envOn()
             if not voidEnabled then startVoid() end
             Library:Notify('anti-ue engaged', 2)
         else
@@ -1807,10 +2087,11 @@ AUBox:AddToggle('VoidAntiUE', {
 })
 
 AUBox:AddDropdown('VoidAUMode', {
-    Values = { 'Stand', 'Altitude' },
+    Values = { 'Below', 'Ring', 'Mirror', 'Altitude' },
     Default = 1,
     Text = 'Mode',
-    Callback = function(v) CFG.AU_MODE = v end,
+    Tooltip = 'Below: under the surface they stand over, so their hitscan meets the floor. Ring: an accepted far coordinate nothing can reach. Mirror: their exact spot. Altitude: your X/Z at their height.',
+    Callback = function(v) CFG.AU_MODE = v; AU.pos, AU.src = nil, nil end,
 })
 
 AUBox:AddSlider('VoidAUMin', {
@@ -1835,7 +2116,7 @@ AUBox:AddSlider('VoidAUOffset', {
 
 auStatus = AUBox:AddLabel('off')
 
-AUBox:AddLabel('Stand takes their spot. Altitude keeps your X/Z.', true)
+AUBox:AddLabel('Below ends the climb. Ring is the panic button.', true)
 
 --==================================================
 -- RIOT ABUSER (matches screenshot)
@@ -4519,9 +4800,12 @@ local THEMES = {
     ['Banware Mono']   = { accent = 'ffffff', main = '1c1c22', bg = '121216', font = 'ffffff', outline = '464650' },
 }
 
+-- Dark palettes first. The list order is what the dropdown shows top to
+-- bottom, and the first entry is what an empty or stale config lands on, so a
+-- light "main" colour must never sit at the top of it.
 local THEME_NAMES = {
-    'Sakura Bloom', 'Cherry Pink', 'Rose Garden', 'Mae Pink', 'Lavender Field',
-    'Nihon Crimson', 'Elisium Rose', 'Ice Blue', 'Banware Mono',
+    'Elisium Rose', 'Nihon Crimson', 'Ice Blue', 'Lavender Field', 'Mae Pink',
+    'Rose Garden', 'Cherry Pink', 'Banware Mono', 'Sakura Bloom',
 }
 
 local petalHolder, petalMain, petalsOn = nil, nil, false
@@ -5455,7 +5739,7 @@ nativeStatusLabel = UtilQueueNative:AddLabel(
 -- THEME UI
 UtilTheme:AddDropdown('UtilTheme', {
     Values = THEME_NAMES,
-    Default = 7,
+    Default = 1,
     Text = 'Preset',
     Callback = function(v)
         THEME_KEEP.name = v
@@ -6358,7 +6642,7 @@ local __bwPresets = function()
         VoidDistance = 100,
         MovementSpeed = 1000000,
         EffectRadius = 1000000000,
-        SetXDist = 1000000, SetYDist = 0, SetZDist = 1000000,
+        SetXDist = 200000000, SetYDist = 0, SetZDist = 200000000,
         VoidTLServer = true, VoidTLGate = true, VoidTLRange = 1000,
     }
 
@@ -6398,22 +6682,37 @@ local __bwPresets = function()
         return n
     end
 
+    -- Presets, retuned from the eight logged sessions.
+    --
+    -- What the logs actually showed: 14 of 18 opponents replicated off the map
+    -- at ring coordinates (speed to 4.2e10, altitude to +-2.1e9), only 4 were
+    -- normal players, and every kill on us landed inside 25 studs. That rules
+    -- out huge one-off offsets and rules in three things:
+    --
+    --   * Underground at Kicia's real default depth (10), not 14. 14 sits one
+    --     stud above her clamp and costs headroom under thin floors.
+    --   * Anti-UE Below, never Stand. Stand was armed 11 times and won once.
+    --   * transport values inside the accepted band, so nothing is rejected.
+    --
+    -- All four themes are dark; Sakura Bloom (the white one) is never used.
     local PRESETS = {
         {
             id = '1-anti-rage',
             label = '1 - Anti-Rage',
             theme = 'Nihon Crimson',
             sound = 'Rocket',
-            blurb = 'knife or shotgun, underground, lift armed',
+            blurb = 'underground, below-climb counter armed',
+            weapon = 'Knife (melee)',
+            why = 'you fight from under the floor - the kill is a pop-up backstab, and backstab is a melee-only flag',
             v = merge(MAXED, {
                 RandomizerMethod = 'Chaos',
                 MovementPattern = 'Desync',
                 VoidHideMode = 'Underground',
-                VoidUGDepth = 14,
-                VoidUEClimb = 1000000000, VoidUECooldown = 0,
-                VoidTLSwing = 1000000000, VoidTLSpeed = 8,
-                VoidRandRadius = 1000000000,
-                VoidAUMode = 'Stand', VoidAUMin = 150, VoidAUOffset = 3,
+                VoidUGDepth = 10,
+                VoidRandRadius = 200,
+                VoidUEClimb = 1000, VoidUECooldown = 0.2,
+                VoidTLSwing = 0, VoidTLSpeed = 3, VoidTLOffset = -5,
+                VoidAUMode = 'Below', VoidAUMin = 150, VoidAUOffset = 3,
             }),
             post = { EnableVoidHide = true, VoidAntiUE = true },
         },
@@ -6422,17 +6721,19 @@ local __bwPresets = function()
             label = '2 - Anti-Legit',
             theme = 'Ice Blue',
             sound = 'Glitch',
-            blurb = 'shotgun main, knife backup, translocate swing',
+            blurb = 'translocate onto the safe out-of-bounds part, no counter',
+            weapon = 'Assault rifle',
+            why = 'you are anchored outside hitscan range, so the gun is for re-engaging after you drop the anchor, not for fighting from it',
             v = merge(MAXED, {
                 MovementPattern = 'Orbit',
                 VoidHideMode = 'Translocate',
                 VoidTLOffset = -5,
-                VoidTLSwing = 5000,
+                VoidTLSwing = 0,
                 VoidTLSpeed = 6,
-                VoidUGDepth = 14,
-                VoidRandRadius = 1000000000,
-                VoidUEClimb = 1000000000, VoidUECooldown = 0,
-                VoidAUMode = 'Stand', VoidAUMin = 150, VoidAUOffset = 3,
+                VoidUGDepth = 10,
+                VoidRandRadius = 200,
+                VoidUEClimb = 1000, VoidUECooldown = 0.2,
+                VoidAUMode = 'Below', VoidAUMin = 150, VoidAUOffset = 3,
             }),
             post = { EnableVoidHide = true, VoidAntiUE = false },
         },
@@ -6441,31 +6742,36 @@ local __bwPresets = function()
             label = '3 - UE Counter',
             theme = 'Lavender Field',
             sound = 'Pulse',
-            blurb = 'stand on the climber, no gate, no offset',
+            blurb = 'below-climb at any altitude, ring on standby',
+            weapon = 'Shotgun class',
+            why = 'the climber has to come back down to hit you - the exchange happens at ground level inside 25 studs',
             v = merge(MAXED, {
                 MovementPattern = 'None',
                 VoidHideMode = 'Underground',
-                VoidUGDepth = 14,
-                VoidAUMode = 'Stand', VoidAUMin = 0, VoidAUOffset = 0,
+                VoidUGDepth = 10,
+                VoidRandRadius = 200,
+                VoidAUMode = 'Below', VoidAUMin = 0, VoidAUOffset = 0,
             }),
             post = { EnableVoidHide = false, VoidAntiUE = true },
         },
         {
             id = '4-everything',
             label = '4 - Everything',
-            theme = 'Sakura Bloom',
+            theme = 'Banware Mono',
             sound = 'Bass',
-            blurb = 'lift first, random shell behind it, both weapons',
+            blurb = 'random ring, counter below, both weapons',
+            weapon = 'Knife + rifle (Both profile)',
+            why = 'the mode flips between ring and below, so keep both classes armed instead of swapping mid-match',
             v = merge(MAXED, {
                 RandomizerMethod = 'Quantum',
                 MovementPattern = 'Erratic',
                 VoidHideMode = 'Random',
-                VoidRandRadius = 1000000000,
-                VoidUGDepth = 14,
-                VoidTLSwing = 1000000000,
-                VoidTLSpeed = 8,
-                VoidUEClimb = 1000000000, VoidUECooldown = 0,
-                VoidAUMode = 'Stand', VoidAUMin = 100, VoidAUOffset = 2,
+                VoidRandRadius = 400,
+                VoidUGDepth = 10,
+                VoidTLSwing = 0,
+                VoidTLSpeed = 3, VoidTLOffset = -5,
+                VoidUEClimb = 5000, VoidUECooldown = 0.2,
+                VoidAUMode = 'Below', VoidAUMin = 100, VoidAUOffset = 2,
             }),
             post = { EnableVoidHide = true, VoidAntiUE = true },
         },
@@ -6478,7 +6784,10 @@ local __bwPresets = function()
         for k, v in pairs(p.post) do
             if setOpt(k, v) then n = n + 1 end
         end
-        Library:Notify(string.format('%s applied - %d options', p.label, n), 3)
+        BWP.appliedId = p.id
+        BWP.appliedWeapon = p.weapon
+        Library:Notify(string.format('%s applied - %d options | weapon: %s', p.label, n,
+            tostring(p.weapon or 'any')), 3)
         return n
     end
 
@@ -6499,6 +6808,7 @@ local __bwPresets = function()
             Func = function() applyPreset(p) end,
         })
         Box:AddLabel(p.blurb, true)
+        Box:AddLabel('weapon: ' .. tostring(p.weapon or 'any') .. ' - ' .. tostring(p.why or ''), true)
     end
 
     -- Weapon swap without touching the rest of the config. Both is the default
@@ -6583,7 +6893,8 @@ if configSectionLoaded then
         if name and name ~= 'none' and BWP.byId[name] then
             local ok, n = pcall(BWP.apply, BWP.byId[name])
             if ok then
-                Library:Notify(string.format('Auto loaded preset %q - %d options', name, n or 0), 4)
+                Library:Notify(string.format('Auto loaded preset %q - %d options | weapon: %s',
+                    name, n or 0, tostring(BWP.byId[name].weapon or 'any')), 4)
             else
                 warn('[Banware] Preset autoload failed: ' .. tostring(n))
             end
@@ -6733,29 +7044,75 @@ local __bwRecorder = function()
         return nil
     end
 
-    -- Rivals does not expose equipped items as Tools, so the fighter object is
-    -- asked first and the character is only the fallback. Whichever path
-    -- answered is written into the match file, so the next build can drop the
-    -- paths that never fire.
+    -- Rivals does not expose equipped items as Tools. The fighter object is the
+    -- source of truth: ClientFighter.Items is an array of ClientItem and
+    -- ClientFighter.EquippedItem is the one in hand (FighterInterface reads both
+    -- directly). The item name lives on .Name; a table that answers only through
+    -- Get() is asked as a last resort. Whichever path answered is written into
+    -- the match file, so a path that never fires can be dropped next build.
+    local function itemName(it)
+        if type(it) == 'string' then return it end
+        if type(it) ~= 'table' then return nil end
+        local n = it.Name or it.ItemName or it.name or it.DisplayName
+        if type(n) == 'string' and n ~= '' then return n end
+        local ok, v = pcall(function() return it:Get('Name') end)
+        if ok and type(v) == 'string' and v ~= '' then return v end
+        return nil
+    end
+
+    local function fighterOf(plr)
+        local fc = fighters()
+        if not fc then return nil end
+        local ok, f = pcall(function() return fc:GetFighter(plr) end)
+        if ok and type(f) == 'table' then return f end
+        return nil
+    end
+
+    local function equippedOf(plr)
+        local f = fighterOf(plr)
+        if not f then return nil end
+        local ok, e = pcall(function() return f.EquippedItem end)
+        if ok then
+            local n = itemName(e)
+            if n then return n end
+        end
+        return nil
+    end
+
     local function probeLoadout(plr)
         local names, source = {}, nil
-        local fc = fighters()
-        if fc then
-            local ok, fighter = pcall(function() return fc:GetFighter(plr) end)
-            if ok and type(fighter) == 'table' then
-                local ok2, items = pcall(function() return fighter:GetItems() end)
-                if ok2 and type(items) == 'table' then
-                    for k, v in pairs(items) do
-                        local n
-                        if type(v) == 'table' then
-                            n = v.Name or v.ItemName or v.name
-                        elseif type(k) == 'string' then
-                            n = k
-                        end
-                        if type(n) == 'string' then names[#names + 1] = n end
-                    end
-                    if #names > 0 then source = 'fighter' end
+        local f = fighterOf(plr)
+        if f then
+            local ok, items = pcall(function() return f.Items end)
+            if ok and type(items) == 'table' then
+                for i = 1, #items do
+                    local n = itemName(items[i])
+                    if n then names[#names + 1] = n end
                 end
+                if #names > 0 then source = 'Items' end
+            end
+            if #names == 0 then
+                local ok2, other = pcall(function() return f:GetItems() end)
+                if ok2 and type(other) == 'table' then
+                    for k, v in pairs(other) do
+                        local n = itemName(v) or (type(k) == 'string' and k or nil)
+                        if n then names[#names + 1] = n end
+                    end
+                    if #names > 0 then source = 'GetItems' end
+                end
+            end
+            local eq = equippedOf(plr)
+            if eq then
+                local tagged = false
+                for i = 1, #names do
+                    if names[i] == eq then
+                        names[i] = eq .. ' *'
+                        tagged = true
+                        break
+                    end
+                end
+                if not tagged then names[#names + 1] = eq .. ' *' end
+                source = (source or 'equipped') .. '+equipped'
             end
         end
         if #names == 0 then
@@ -6772,7 +7129,8 @@ local __bwRecorder = function()
     end
 
     local function snapshotConfig()
-        local out = { toggles = {}, options = {} }
+        local out = { toggles = {}, options = {}, preset = BWP.appliedId or BWP.autoloadName,
+            presetWeapon = BWP.appliedWeapon }
         for k, o in pairs(Library.Toggles or {}) do
             local ok, v = pcall(function() return o.Value end)
             if ok then out.toggles[k] = safe(v) end
@@ -6813,7 +7171,20 @@ local __bwRecorder = function()
             loadoutSource = nil,
             hitsOnMe = 0,
             killedMe = 0,
+            lastGood = nil,
+            look = nil,
             events = {},
+            -- real vs replicated: a sample is fake when it is outside the map
+            -- volume or crossed 2000 studs in one tick. The dump's own
+            -- validator is consulted for the ring cases so the verdict names
+            -- the exact mechanism instead of "big number".
+            fakeN = 0, realN = 0, ringN = 0,
+            fakePos = nil, realPos = nil, fakeMax = 0,
+            towardMe = 0, awayMe = 0, moving = 0,
+            air = 0, jumpReq = 0,
+            equip = nil, equipSeen = {},
+            dest = nil,
+            trail = {}, trailN = 0, trailFake = 0,
         }
     end
 
@@ -6833,7 +7204,7 @@ local __bwRecorder = function()
             started = stamp(),
             elapsed = 0,
             detect = source,
-            myLoadout = { items = names, source = lsrc },
+            myLoadout = { items = names, source = lsrc, equip = equippedOf(LocalPlayer) },
             cfg = snapshotConfig(),
             me = { name = LocalPlayer.Name, id = LocalPlayer.UserId,
                    spawn = hrp and vec(hrp.Position) or nil },
@@ -6856,8 +7227,38 @@ local __bwRecorder = function()
         add('- result **' .. tostring(m.result) .. '** (' .. tostring(m.endReason) .. ')')
         add('- my loadout: ' .. table.concat(m.myLoadout.items or {}, ', ')
             .. ' [' .. tostring(m.myLoadout.source) .. ']')
+        add('- in hand at start: ' .. tostring(m.myLoadout.equip or 'unknown'))
         if m.killedBy then
-            add('- killed by: ' .. tostring(m.killedBy.name) .. ' (' .. tostring(m.killedBy.weapon) .. ')')
+            local kb = m.killedBy
+            add(string.format('- killed by: %s (%s) id %s, %.0f studs, %.0f deg',
+                tostring(kb.name), tostring(kb.weapon),
+                tostring(kb.id), kb.dist or 0, kb.angle or 0))
+            add(string.format('- killer read at death: %s, speed max %.0f, altitude %.0f, ring samples %d',
+                kb.fromDesync and 'from a desynced position' or 'live position',
+                kb.speed or 0, kb.alt or 0, kb.ring or 0))
+            if kb.loadout and kb.loadout ~= '' then
+                add('- killer loadout: ' .. tostring(kb.loadout))
+            end
+        end
+        add('')
+        add('## my config')
+        do
+            local keys = {
+                'UtilTheme', 'EnableVoidHide', 'VoidHideMode', 'VoidAntiUE',
+                'VoidAUMode', 'VoidAUMin', 'VoidAUOffset', 'VoidUGDepth',
+                'VoidRandRadius', 'VoidUEClimb', 'VoidUECooldown',
+                'VoidTLServer', 'VoidTLGate', 'VoidTLRange', 'VoidTLOffset',
+                'VoidTLSwing', 'VoidTLSpeed', 'MovementPattern',
+                'RandomizerMethod', 'MovementSpeed',
+            }
+            local cfg = m.cfg or { toggles = {}, options = {} }
+            add(string.format('- preset = %s', tostring(cfg.preset or 'none')))
+            add(string.format('- recommended weapon = %s', tostring(cfg.presetWeapon or 'any')))
+            for _, k in ipairs(keys) do
+                local v = (cfg.options and cfg.options[k])
+                if v == nil and cfg.toggles then v = cfg.toggles[k] end
+                if v ~= nil then add(string.format('- %s = %s', k, tostring(v))) end
+            end
         end
         add('')
         add('## opponents')
@@ -6877,14 +7278,54 @@ local __bwRecorder = function()
                 o.yMax or 0, o.yMin or 0))
             add('- loadout: ' .. table.concat(o.weapons or {}, ', ')
                 .. ' [' .. tostring(o.loadoutSource) .. ']')
+            add('- in hand at last sample: ' .. tostring(o.equip or 'unknown'))
+            local eq = {}
+            for k in pairs(o.equipSeen or {}) do eq[#eq + 1] = k end
+            table.sort(eq)
+            if #eq > 0 then add('- weapons seen: ' .. table.concat(eq, ', ')) end
+            add(string.format('- samples on the map %d / off the map %d (ring %d)',
+                o.realN or 0, o.fakeN or 0, o.ringN or 0))
+            if o.fakePos then
+                add(string.format('- last fake position %.0f %.0f %.0f (|p| %.0e)',
+                    o.fakePos.x or 0, o.fakePos.y or 0, o.fakePos.z or 0, o.fakeMax or 0))
+            end
+            if o.realPos then
+                add(string.format('- last real position %.0f %.0f %.0f',
+                    o.realPos.x or 0, o.realPos.y or 0, o.realPos.z or 0))
+            end
+            add(string.format('- heading: %d samples moving, %d at me, %d away',
+                o.moving or 0, o.towardMe or 0, o.awayMe or 0))
+            if o.dest then
+                add(string.format('- last destination %.0f %.0f %.0f',
+                    o.dest.x or 0, o.dest.y or 0, o.dest.z or 0))
+            end
+            add(string.format('- airborne %d samples, jump held %d', o.air or 0, o.jumpReq or 0))
             add(string.format('- hits on me %d, killed me %d', o.hitsOnMe or 0, o.killedMe or 0))
             local flags = {}
+            if (o.ringN or 0) > 0 then flags[#flags + 1] = 'ring desync' end
+            if (o.fakeN or 0) > 0 and (o.ringN or 0) == 0 then flags[#flags + 1] = 'off-map position' end
             if (o.speedMax or 0) > 400 then flags[#flags + 1] = 'speed' end
             if (o.spinDeg or 0) > 400 then flags[#flags + 1] = 'spinbot' end
-            if (o.desync or 0) > 0 then flags[#flags + 1] = 'desync' end
+            if (o.desync or 0) > 0 then flags[#flags + 1] = 'return-to-origin desync' end
             if (o.yMax or 0) > 200 then flags[#flags + 1] = 'altitude' end
             if (o.bigJumps or 0) > 0 then flags[#flags + 1] = 'teleport jumps' end
+            if (o.jumpReq or 0) > (o.samples or 1) * 0.6 then flags[#flags + 1] = 'jump held (bhop macro)' end
             add('- reads as: ' .. (#flags > 0 and table.concat(flags, ', ') or 'nothing flagged'))
+            local tr = o.trail or {}
+            if #tr > 0 then
+                add(string.format('- trail: %d points (%d fake), %s -> %s',
+                    #tr, o.trailFake or 0,
+                    string.format('%.0f,%.0f,%.0f', tr[1].x, tr[1].y, tr[1].z),
+                    string.format('%.0f,%.0f,%.0f', tr[#tr].x, tr[#tr].y, tr[#tr].z)))
+                local step = math.max(1, math.floor(#tr / 30))
+                local i = 1
+                while i <= #tr and i <= 30 * step do
+                    local q = tr[i]
+                    add(string.format('  - %6.1fs %s (%.0f, %.0f, %.0f)',
+                        q.t or 0, q.f == 1 and 'fake' or 'real', q.x or 0, q.y or 0, q.z or 0))
+                    i = i + step
+                end
+            end
             local shown = 0
             for _, e in ipairs(o.events or {}) do
                 if shown < 25 then
@@ -6922,9 +7363,33 @@ local __bwRecorder = function()
             game = R.gameIdx,
             session = R.session,
             written = stamp(),
+            summary = R.gameSummary,
             matches = R.gameMatches,
         }
         writeJson(string.format('%s/game%02d.json', dir(), R.gameIdx), g)
+        writeText(string.format('%s/game%02d.md', dir(), R.gameIdx), (function()
+            local L = {}
+            local function add(s) L[#L + 1] = s end
+            add('# Banware game ' .. tostring(R.gameIdx))
+            add('')
+            add('- session ' .. tostring(R.session) .. ', written ' .. tostring(g.written))
+            if R.gameSummary then
+                add(string.format('- result: %d W / %d L', R.gameSummary.wins, R.gameSummary.losses))
+            end
+            add('')
+            add('| # | result | len | mode | preset | killed by | weapon | at | opponent read |')
+            add('|---|---|---|---|---|---|---|---|---|')
+            for i = 1, #R.gameMatches do
+                local m = R.gameMatches[i]
+                add(string.format('| %s | %s | %.0fs | %s | %s | %s | %s | %s | %s |',
+                    tostring(m.index), tostring(m.result), m.length or 0,
+                    tostring(m.hideMode), tostring(m.preset),
+                    tostring(m.killedBy or '-'), tostring(m.weaponUsed or '-'),
+                    m.killedAt and string.format('%.0f', m.killedAt) or '-',
+                    tostring(m.reads or '-')))
+            end
+            return table.concat(L, '\n')
+        end)())
         writeJson(string.format('%s/session.json', dir()), {
             session = R.session,
             matches = R.matchIdx,
@@ -6952,6 +7417,8 @@ local __bwRecorder = function()
                 tr.lastFacing = nil
                 tr.prevJumpPos = nil
                 tr.lastT = nil
+                if tr.lastGood then tr.lastGood = vec(tr.lastGood) end
+                if tr.look then tr.look = vec(tr.look) end
                 arr[#arr + 1] = tr
             end
         end
@@ -6969,19 +7436,44 @@ local __bwRecorder = function()
             reason = m.endReason,
             length = m.elapsed,
             killedBy = m.killedBy and m.killedBy.name or nil,
+            killedAt = m.killedBy and m.killedBy.dist or nil,
+            weaponUsed = m.killedBy and m.killedBy.weapon or nil,
+            preset = m.cfg and m.cfg.preset or nil,
+            theme = m.cfg and m.cfg.options and m.cfg.options.UtilTheme or nil,
+            hideMode = m.cfg and m.cfg.options and m.cfg.options.VoidHideMode or nil,
+            antiUE = m.cfg and m.cfg.toggles and m.cfg.toggles.VoidAntiUE or nil,
             opponents = (function()
                 local names = {}
-                for i = 1, #arr do
-                    names[i] = arr[i].name
-                end
+                for i = 1, #arr do names[i] = arr[i].name end
                 return names
+            end)(),
+            reads = (function()
+                local out = {}
+                for i = 1, #arr do
+                    local o = arr[i]
+                    local f = {}
+                    if (o.ringN or 0) > 0 then f[#f + 1] = 'ring desync' end
+                    if (o.speedMax or 0) > 400 then f[#f + 1] = 'speed' end
+                    if (o.yMax or 0) > 200 then f[#f + 1] = 'altitude' end
+                    if (o.spinDeg or 0) > 400 then f[#f + 1] = 'spinbot' end
+                    if #f == 0 then f[1] = 'normal' end
+                    out[i] = string.format('%s: %s (spd %.0f, alt %.0f)',
+                        o.name, table.concat(f, '/'), o.speedMax or 0, o.yMax or 0)
+                end
+                return table.concat(out, ' | ')
             end)(),
         }
 
         if #R.gameMatches >= 5 then
+            local w, l = 0, 0
+            for i = 1, #R.gameMatches do
+                if R.gameMatches[i].result == 'win' then w = w + 1 else l = l + 1 end
+            end
+            R.gameSummary = { wins = w, losses = l }
             writeGame()
             R.gameIdx = R.gameIdx + 1
             R.gameMatches = {}
+            R.gameSummary = nil
         else
             writeJson(string.format('%s/session.json', dir()), {
                 session = R.session,
@@ -6995,9 +7487,23 @@ local __bwRecorder = function()
 
     ---------------------------------------------------------------- tracking
 
-    local function tickTrack(tr, rp, t)
+    local function tickTrack(tr, rp, t, plr)
         local p = rp.Position
         tr.samples = tr.samples + 1
+
+        local look = rp.CFrame.LookVector
+        local vel = rp.AssemblyLinearVelocity
+        local h = rp.Parent and rp.Parent:FindFirstChildOfClass('Humanoid')
+        local myRoot = getRoot()
+        local my = myRoot and myRoot.Position or nil
+
+        -- A coordinate is fake when it is outside the map volume or when the
+        -- body crossed 2000 studs in a single sample. Rivals maps are a few
+        -- thousand studs across; the inner ring starts at 65,536, so 1e6 is a
+        -- safe outer bound for "still on the map".
+        local inMap = math.abs(p.X) < 1e6 and math.abs(p.Z) < 1e6
+            and p.Y > R.baselineY - 2000 and p.Y < R.baselineY + 20000
+        local teleported = false
 
         if tr.lastPos then
             local d = (p - tr.lastPos).Magnitude
@@ -7007,6 +7513,7 @@ local __bwRecorder = function()
             if sp > tr.speedMax then tr.speedMax = sp end
             tr.dist = tr.dist + d
             if d > tr.maxJump then tr.maxJump = d end
+            if d > 2000 then teleported = true end
             if d > 40 then
                 tr.jumps = tr.jumps + 1
                 if d > 200 then
@@ -7026,9 +7533,66 @@ local __bwRecorder = function()
             end
         end
 
-        local look = rp.CFrame.LookVector
+        -- real / fake split. The movement the server actually accepts is the
+        -- in-map path; the rest is the cheat's own replica talking.
+        if (not inMap) or teleported then
+            tr.fakeN = tr.fakeN + 1
+            tr.fakePos = vec(p)
+            local mag = p.Magnitude
+            if mag > tr.fakeMax then tr.fakeMax = mag end
+            if RING.valid(p) then
+                tr.ringN = tr.ringN + 1
+                if tr.ringN % 20 == 1 then
+                    push(tr, 'ring', { pos = vec(p), ring = RING.valid(p) })
+                end
+            end
+        else
+            tr.realN = tr.realN + 1
+            tr.realPos = vec(p)
+        end
+
+        -- where they are going, and whether it is at us
+        local spd = vel.Magnitude        if spd > 1 then
+            tr.moving = tr.moving + 1
+            tr.dest = vec(p + vel * 0.5)
+            if my then
+                local off = my - p
+                if off.Magnitude > 0.5 then
+                    local dot = vel.Unit:Dot(off.Unit)
+                    if dot > 0.4 then
+                        tr.towardMe = tr.towardMe + 1
+                    elseif dot < -0.4 then
+                        tr.awayMe = tr.awayMe + 1
+                    end
+                end
+            end
+        end
+
+        -- what is in their hands, sampled every tick, so a weapon swap before a
+        -- kill is on the record
+        local eq = equippedOf(plr)
+        if eq then
+            tr.equip = eq
+            if not tr.equipSeen[eq] then
+                tr.equipSeen[eq] = 1
+                push(tr, 'weapon', { name = eq })
+            end
+        end
+
+        -- airborne ticks and requested jumps: the difference between a player
+        -- bunny-hopping and a ragebot holding space
+        if h then
+            if h.FloorMaterial ~= Enum.Material.Air then
+                -- grounded
+            else
+                tr.air = tr.air + 1
+            end
+            if h.Jump then tr.jumpReq = tr.jumpReq + 1 end
+        end
+
+        local lookCheck = look
         if tr.lastFacing then
-            local dot = math.clamp(look:Dot(tr.lastFacing), -1, 1)
+            local dot = math.clamp(lookCheck:Dot(tr.lastFacing), -1, 1)
             local ang = math.deg(math.acos(dot))
             if ang > 45 then
                 tr.spinDeg = tr.spinDeg + ang
@@ -7038,7 +7602,8 @@ local __bwRecorder = function()
                 end
             end
         end
-        tr.lastFacing = look
+        tr.lastFacing = lookCheck
+        tr.look = lookCheck
         tr.lastPos = p
         tr.lastT = t
 
@@ -7047,16 +7612,37 @@ local __bwRecorder = function()
         if relY < tr.yMin then tr.yMin = relY end
         if relY > 250 then tr.highYSamples = tr.highYSamples + 1 end
 
-        local h = rp.Parent and rp.Parent:FindFirstChildOfClass('Humanoid')
+        -- position trail: one point every other sample (5 Hz at the default
+        -- 10 Hz recorder), plus every fake/real transition and every >500-stud
+        -- move. 400 points is 200 s of match, which covers the long duels; the
+        -- old rows only kept the last coordinate, so a body that moved through
+        -- the ring and back left no record of which points were which.
+        tr.trailN = tr.trailN + 1
+        local state = (not inMap or teleported) and 1 or 0
+        local moved = tr.lastPos and (p - tr.lastPos).Magnitude or 0
+        if tr.trailN % 2 == 0 or state ~= tr.trailState or moved > 500 then
+            if #tr.trail >= 400 then table.remove(tr.trail, 1) end
+            tr.trail[#tr.trail + 1] = {
+                t = num(t), x = num(p.X), y = num(p.Y), z = num(p.Z), f = state,
+            }
+            if state == 1 then tr.trailFake = tr.trailFake + 1 end
+        end
+        tr.trailState = state
+
         tr.now = {
             pos = vec(p),
-            vel = vec(rp.AssemblyLinearVelocity),
+            real = tr.realPos,
+            fake = tr.fakePos,
+            vel = vec(vel),
+            dest = tr.dest,
             look = vec(look),
             move = h and vec(h.MoveDirection) or nil,
             walk = h and num(h.WalkSpeed) or nil,
             hp = h and num(h.Health) or nil,
+            equip = tr.equip,
+            air = h and h.FloorMaterial == Enum.Material.Air or nil,
         }
-        tr.endPos = vec(p)
+        tr.endPos = vec(tr.realPos or p)
     end
 
     local function onDamage(dmg, hp)
@@ -7073,17 +7659,31 @@ local __bwRecorder = function()
                 local ch = plr.Character
                 local rp = ch and ch:FindFirstChild('HumanoidRootPart')
                 local h = ch and ch:FindFirstChildOfClass('Humanoid')
-                if tr and rp and h and h.Health > 0 then
-                    local d = (rp.Position - my).Magnitude
-                    if d <= 800 then
-                        local off = my - rp.Position
+                if tr then
+                    -- A cheat that replicates its body at 1e9 leaves no live
+                    -- position to score against, and that is exactly when a hit
+                    -- lands. Fall back to the last place it was actually seen,
+                    -- flagged, instead of writing an unattributed row.
+                    local pos, live = nil, false
+                    if rp and h and h.Health > 0 then
+                        if (rp.Position - my).Magnitude <= 800 then
+                            pos, live = rp.Position, true
+                        end
+                    end
+                    if not pos and tr.lastGood and (tr.lastGood - my).Magnitude <= 4000 then
+                        pos = tr.lastGood
+                    end
+                    if pos then
+                        local d = (pos - my).Magnitude
+                        local off = my - pos
                         local dirv = off.Magnitude > 0.001 and off.Unit or Vector3.zero
-                        local dot = math.clamp(rp.CFrame.LookVector:Dot(dirv), -1, 1)
+                        local look = live and rp.CFrame.LookVector or tr.look or Vector3.zero
+                        local dot = math.clamp(look:Dot(dirv), -1, 1)
                         local ang = math.deg(math.acos(dot))
-                        local score = (1 - d / 800) * (ang < 60 and 1 or 0.15)
+                        local score = (1 - d / 800) * (live and (ang < 60 and 1 or 0.15) or 0.4)
                         if score > bestScore then
                             bestScore, best = score, plr
-                            bestInfo = { d = num(d), ang = num(ang) }
+                            bestInfo = { d = num(d), ang = num(ang), desync = not live }
                         end
                     end
                 end
@@ -7097,15 +7697,28 @@ local __bwRecorder = function()
             rec.by = best.Name
             rec.dist = bestInfo.d
             rec.angle = bestInfo.ang
-            if bestInfo.ang > 60 then
+            if bestInfo.desync then
+                rec.desynced = true
+                push(tr, 'hit_from_desync', { d = bestInfo.d })
+            elseif bestInfo.ang > 60 then
                 rec.silentaim = true
                 push(tr, 'silentaim', { angle = bestInfo.ang, dist = bestInfo.d })
             end
             if hp <= 0 then
                 tr.killedMe = tr.killedMe + 1
                 rec.killed = true
+                local gun = equippedOf(best)
                 m.killedBy = { name = best.Name, id = best.UserId,
-                    weapon = table.concat(tr.weapons or {}, ','), dist = bestInfo.d }
+                    weapon = gun or table.concat(tr.weapons or {}, ','),
+                    dist = bestInfo.d, angle = bestInfo.ang,
+                    -- what the killer looked like at the moment of the kill, so
+                    -- the row says "ring desync at 2.1e9" instead of "died"
+                    speed = num(tr.speedMax or 0),
+                    ring = tr.ringN or 0,
+                    fake = tr.fakeN or 0,
+                    alt = num(tr.yMax or 0),
+                    fromDesync = bestInfo.desync and true or false,
+                    loadout = table.concat(tr.weapons or {}, ',') }
             end
         end
         m.hits[#m.hits + 1] = rec
@@ -7148,7 +7761,20 @@ local __bwRecorder = function()
                         tr.weapons = names
                         tr.loadoutSource = src
                     end
-                    tickTrack(tr, rp, t)
+                    -- last position that was actually near the fight, so a body
+                    -- that starts replicating at 1e9 still has an address to be
+                    -- blamed at
+                    if tr.lastGood then
+                        if (rp.Position - tr.lastGood).Magnitude > 2000 then
+                            -- keep the old one: this sample is a teleport, not a
+                            -- place a shot could have come from
+                        else
+                            tr.lastGood = rp.Position
+                        end
+                    else
+                        tr.lastGood = rp.Position
+                    end
+                    tickTrack(tr, rp, t, plr)
                 end
             end
         end
@@ -7205,7 +7831,11 @@ local __bwRecorder = function()
         elseif duel == false then
             endMatch('win', 'duel ended alive')
         elseif duel == nil and not near and R.idleT > 4 then
-            endMatch('win', 'no contact for 4s')
+            -- proximity fallback: the duel flag was never readable this
+            -- session, so there is no result to claim. Recording this as a win
+            -- is what made two losses look like victories in the first set of
+            -- logs.
+            endMatch('unknown', 'lost contact (proximity)')
         elseif (R.cur.elapsed or 0) > 900 then
             endMatch('unknown', 'timeout')
         end
